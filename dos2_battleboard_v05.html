@@ -1,0 +1,1086 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Battleboard v04 — DOS2 Tabletop</title>
+<link rel="stylesheet" href="dos2_battleboard_v05.css">
+</head>
+<body>
+<header><div><h1>⚔ BATTLEBOARD <span class="muted">/ DOS2 TABLETOP · v05</span></h1><small>Engine-driven combat: targeting, gear, surfaces, XP, DM tools, undo, autosave</small></div><div class="row"><label class="check"><input type="checkbox" id="playerView"> Player view</label><button id="undoBtn">↶ Undo</button><button id="saveBtn">Export encounter</button><button id="loadBtn">Import encounter</button><input id="loadFile" type="file" accept=".json,application/json" hidden></div></header>
+<div class="app">
+<aside class="panel left">
+<h2>Encounter</h2>
+<div class="section stack">
+<label>Name<input id="encName" type="text" value="Untitled encounter"></label>
+<div class="row"><label>Columns<input id="cols" type="number" min="6" max="30" value="14"></label><label>Rows<input id="rows" type="number" min="6" max="24" value="10"></label><button id="resize">Resize</button></div>
+<div class="row"><label>AP / turn (new)<input id="setApTurn" type="number" min="0" value="4"></label><label>Max AP (new)<input id="setMaxAp" type="number" min="0" value="6"></label></div>
+<button id="applyAp" class="wide">Apply AP settings to all combatants</button>
+<label class="check"><input type="checkbox" id="autoSurf" checked> Surfaces trigger automatically (entering a tile, start of turn)</label>
+<div class="row"><button id="toolSelect" class="active">Select / move</button><button id="toolAim">Aim skill</button><button id="toolSurface">Paint</button><button id="toolErase">Erase</button></div>
+<label>Surface brush<select id="surfaceType"></select></label>
+<button id="clearSurfaces" class="wide">Clear all surfaces</button>
+<div class="legend" id="legend"></div>
+</div>
+<h2>Add combatant</h2>
+<div class="section stack">
+<div class="row"><label>Name<input id="newName" type="text" placeholder="e.g. Red Prince" class="inline-name"></label><label>Type<select id="newType"><option value="player">Player</option><option value="enemy">Enemy</option></select></label></div>
+<div class="row"><label>Level<input id="newLevel" type="number" min="1" max="21" value="1"></label><label>Vitality<input id="newVit" type="number" min="1" value="100"></label></div>
+<div class="row"><label>Phys. Armour<input id="newPA" type="number" min="0" value="50"></label><label>Magic Armour<input id="newMA" type="number" min="0" value="50"></label></div>
+<label>Portrait (optional, shrunk to 96px)<input id="newPortrait" type="file" accept="image/*"></label>
+<button class="primary wide" id="addCombatant">Add to board</button>
+<div class="row"><label>Enemy template<select id="tplSelect"></select></label><label>Level<input id="tplLevel" type="number" min="1" max="21" value="5"></label></div>
+<button class="wide" id="addTemplate">Add enemy from template</button>
+<div class="notice">Template stats use the level-scaling formulas from Formulas.md. Armour scaling is partly provisional.</div>
+</div>
+<h2>Turn order</h2><div class="section"><div id="combatantList" class="list"></div></div>
+<div id="dmPanel"></div>
+</aside>
+<main class="center">
+<div class="toolbar">
+<button id="nextTurn" class="primary">Next turn →</button><span id="turnLabel" class="pill">Round 1 · No active turn</span><button id="zoomOut" title="Zoom out">−</button><button id="zoomIn" title="Zoom in">+</button><span class="spacer"></span><button id="resetEnc">Reset encounter</button><button id="clearBoard" class="danger">Clear board</button>
+</div>
+<div class="boardwrap"><div id="board" aria-label="Battle grid"></div></div>
+<div class="toolbar"><span class="muted">Selected:</span><button id="apMinus">−1 AP</button><button id="apPlus">+1 AP</button><button id="apFull">Restore AP</button><button id="skipBtn">Skip next turn</button><button id="defeatBtn">Mark defeated</button><button id="surfaceTick">Resolve tile surface</button><span class="spacer"></span><span id="statusText" class="muted tiny">Add a combatant to begin.</span></div>
+</main>
+<aside class="panel right">
+<h2>Selected combatant</h2>
+<div class="section stack" id="selectedPanel"><div class="notice">Select a token or a name in the turn order.</div></div>
+<h2>Use skill</h2>
+<div class="section stack" id="skillPanel"></div>
+<h2>Combat log</h2><div class="section"><div class="log" id="combatLog"></div><div class="row log-actions"><button id="clearLog">Clear log</button></div><p class="notice">The log is saved with the encounter export.</p></div>
+</aside>
+</div>
+<script>
+/* DOS2-inspired combat engine. Pure functions: no DOM, no hidden state, injectable RNG.
+   Constants are labelled V (verified in a cited source), P (provisional) or T (tabletop adaptation). */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.DOS2 = factory();
+})(this, function () {
+  const CONFIG = {
+    attrBase: 10,          // P: attribute value that gives 0% bonus (Formulas.md AttributeBaseValue = 10 is V; +5%/point is P)
+    attrPct: 5,            // P: % damage per attribute point above base
+    abilityPct: 5,         // P: % damage per ability rank (dos2 wiki Warfare page: +5% per point is V for Warfare)
+    critPct: 50,           // P: bonus applied only on a critical hit
+    levelRange: 0.05,      // P: level-scaled skills roll within +/-5% of levelScaledDamage
+    overflowToVitality: true, // T: damage beyond armour spills into Vitality (50 MA + 100 magic = 50 Vitality)
+    apPerTurn: 4,          // T: AP gained at turn start
+    maxAP: 6               // T: AP cap
+  };
+  // T: two damage categories. Physical -> Physical Armour; Magic (elemental subtypes kept for resistances) -> Magic Armour.
+  const ARMOUR = { Physical: 'pa', Magic: 'ma', Fire: 'ma', Water: 'ma', Air: 'ma', Earth: 'ma', Poison: 'ma' };
+  const rf = x => Math.floor(x + 0.5);
+  const num = (v, name) => { if (typeof v !== 'number' || !Number.isFinite(v)) throw new TypeError(`${name} must be a finite number`); return v; };
+  const clone = o => JSON.parse(JSON.stringify(o));
+  const uid = () => Math.random().toString(36).slice(2, 10);
+  const nm = x => x.name || x.id;
+
+  function mulberry32(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  // ---------- Level scaling (V: Formulas.md, Norbyte, DE) ----------
+  function vitalityBoost(level) {
+    let exp = Math.pow(1.25, level - 1);
+    for (const [lv, g] of [[9, 1.25], [13, 1.25], [16, 1.25], [18, 1.35]]) if (level >= lv) exp = exp * g / 1.25;
+    return rf(level * 9.091 + 21 * exp) / 5 * 5.0;
+  }
+  function levelScaledDamage(level) { num(level, 'level'); level = Math.max(1, Math.floor(level)); return vitalityBoost(level) / ((level - 1) * 0.2 + 5); }
+  function healScaling(level, healValue) {
+    const l = levelScaledDamage(level), b = level * 0.015 + 1;
+    return rf(num(healValue, 'healValue') * (b * l) * b * 1.3 / 100);
+  }
+  // NPC scaling. Vitality: V (Formulas.md "Vitality Scaling"). Armour: P (printed formula has a misplaced bracket; read as vitalityBoost*(1+level*0.07)*0.55).
+  const npcVitality = (level, pct) => rf(vitalityBoost(level) * pct / 100);
+  const npcArmour = (level, pct) => rf(vitalityBoost(level) * (1 + level * 0.07) * 0.55 * pct / 100);
+  // V: "Attribute Growth (Level Mapped)" and "Ability Growth" in Formulas.md
+  const npcAttribute = (v, level) => Math.round(Math.ceil((v - 1) / 100 * (2 + 0.75) * level) * 0.7) + 10;
+  const npcAbility = (v, level) => Math.min(rf(level * v * 0.1), 10);
+
+  // ---------- Status effects (central table) ----------
+  // gate: armour pool that must be 0 for the status to apply (dos2.wiki: Burning blocked by MA, Bleeding by PA).
+  // tick.pct is a share of levelScaledDamage(source level): value not published -> T. bypassArmour: official bleeding is piercing.
+  const STATUS = {
+    burning:   { name: 'Burning',    duration: 2, resist: { Fire: -15, Water: 10 }, gate: 'ma', tick: { pct: 0.25, type: 'Fire' },   removedBy: ['water'], note: '2 turns, MA blocks, tick at start of turn (dos2.wiki Burning). Tick size T.' },
+    poisoned:  { name: 'Poisoned',   duration: 2, gate: 'ma', tick: { pct: 0.25, type: 'Poison' }, removedBy: ['cleanse'], note: 'P: duration, tick size and gate not confirmed.' },
+    bleeding:  { name: 'Bleeding',   duration: 3, gate: 'pa', tick: { pct: 0.20, bypassArmour: true }, removedBy: ['cleanse'], note: 'PA blocks; damage ignores armour (dos2.wiki Bleeding). Duration 3 from one item only: P. Tick size T.' },
+    crippled:  { name: 'Crippled',   duration: 1, gate: 'pa', note: '1 turn from Crippling Blow (GameFAQs). Movement penalty is not modelled.' },
+    knockedDown: { name: 'Knocked Down', duration: 1, gate: 'pa', skipsTurn: true, note: '1 turn (GameFAQs). Skipping the turn is T.' },
+    slowed:    { name: 'Slowed',     duration: 2, gate: 'ma', apMod: -1, note: '2 turns from oil (dos2.wiki Fossil Strike). -1 AP and gate are P.' },
+    wet:       { name: 'Wet',       duration: 2, gate: null, resist: { Fire: 10, Water: -10, Air: -20 }, cancels: ['burning'], note: 'Resistance changes from the OS2 wiki Status Effects page. Duration not published: P. Wet cures Burning and blocks it (T).' },
+    chilled:   { name: 'Chilled',   duration: 2, gate: 'ma', resist: { Fire: 10, Water: -20, Air: -10 }, note: 'Resistances from the OS2 wiki. Movement -35% and Dodging -30% are not modelled. Duration P.' },
+    frozen:    { name: 'Frozen',    duration: 1, gate: 'ma', skipsTurn: true, resist: { Fire: 10, Water: -20 }, immuneWhile: ['bleeding', 'poisoned', 'shocked', 'stunned'], note: 'Resistances and immunities from the OS2 wiki. Losing the turn and duration are T/P.' },
+    shocked:   { name: 'Shocked',   duration: 2, gate: 'ma', apMod: -1, resist: { Earth: 10, Air: -15 }, note: 'AP Recovery -1 and resistances from the OS2 wiki. A second Shocked, or Shocked on a Wet target, also Stuns (wiki). Duration P.' },
+    stunned:   { name: 'Stunned',   duration: 1, gate: null, skipsTurn: true, resist: { Earth: 10, Air: -15 }, note: 'Resistances from the OS2 wiki. Losing the turn is T; duration P.' },
+    hasted:    { name: 'Hasted',     duration: 2, gate: null, apMod: 1, clears: ['crippled', 'slowed'], note: '2 turns, clears Crippled/Slowed (GameFAQs Haste). +1 AP is P.' }
+  };
+
+  let gearFn = x => x;                                   // world.js installs the equipment view here
+  const setGear = fn => { gearFn = fn || (x => x); };
+  const statusResist = (t, type) => (t.statuses || []).reduce((n, s) => n + (STATUS[s.id]?.resist?.[type] || 0), 0);
+  const totalResist = (t, type) => Math.max(-200, Math.min(200, ((gearFn(t).resistances || {})[type] || 0) + statusResist(t, type)));
+
+  function applyStatus(t, id, opts = {}) {
+    const def = STATUS[id]; if (!def) throw new Error('Unknown status ' + id);
+    if ((t.immune || []).includes(id)) return { target: t, applied: false, reason: 'immune' };
+    for (const s of t.statuses || []) if ((STATUS[s.id]?.immuneWhile || []).includes(id)) return { target: t, applied: false, reason: 'immune while ' + STATUS[s.id].name };
+    if (id === 'burning' && (t.statuses || []).some(s => s.id === 'wet')) return { target: removeStatuses(t, s => s.id === 'wet'), applied: false, reason: 'Wet is put out instead (T)' };
+    if (def.gate && t[def.gate] > 0 && !opts.ignoreGate) return { target: t, applied: false, reason: (def.gate === 'pa' ? 'Physical' : 'Magic') + ' Armour still up' };
+    const turns = opts.duration ?? def.duration, src = opts.sourceLevel ?? t.level;
+    let list = (t.statuses || []).filter(s => !(def.clears || []).includes(s.id));
+    const ex = list.find(s => s.id === id);
+    if (ex) list = list.map(s => s.id === id ? { ...s, turns: Math.max(s.turns, turns), sourceLevel: src } : s); // refresh, no stacking
+    else list = [...list, { id, turns, sourceLevel: src }];
+    list = list.filter(s => s.id === id || !(def.cancels || []).includes(s.id));
+    const extra = [];
+    if (id === 'shocked' && !opts.noChain && (ex || list.some(s => s.id === 'wet'))) { const r = applyStatus({ ...t, statuses: list }, 'stunned', { sourceLevel: src, noChain: true }); if (r.applied) { list = r.target.statuses; extra.push('stunned'); } }
+    return { target: { ...t, statuses: list }, applied: true, extra };
+  }
+  function removeStatuses(t, pred) { return { ...t, statuses: (t.statuses || []).filter(s => !pred(s)) }; }
+  const cleanseBy = (t, tag) => removeStatuses(t, s => (STATUS[s.id]?.removedBy || []).includes(tag));
+
+  // ---------- Damage ----------
+  // Returns every factor so the UI can show the breakdown. skill.kind: weapon | shield | level | heal
+  function calcSkill(skill, atk, opts = {}, rng = Math.random, cfg = {}) {
+    const c = { ...CONFIG, ...cfg };
+    num(atk.level, 'attacker.level'); num(skill.mult ?? 1, 'skill.mult');
+    const lvl = Math.max(1, Math.floor(atk.level)), hits = skill.hits || 1, mult = skill.mult ?? 1, st = atk.stats || {}, ab = atk.abilities || {};
+    const o = { gear: 0, weapon: 0, misc: 0, highGround: 0, crit: false, resist: 0, ...opts };
+    if (!(skill.type === 'Heal' || skill.type in ARMOUR)) throw new Error('Unknown damage type ' + skill.type);
+    if (skill.kind === 'heal') {
+      if (skill.healValue == null) throw new Error('heal skill needs healValue');
+      const amt = healScaling(lvl, skill.healValue);
+      return { kind: 'heal', type: 'Heal', hits: [{ amount: amt }], total: amt, factors: [{ name: 'Heal scaling (Formulas.md)', value: amt }] };
+    }
+    const [r0, r1] = skill.multRange || [mult, mult];
+    let lo, hi;
+    if (skill.kind === 'weapon') { lo = num(atk.weaponMin, 'weaponMin') * r0; hi = num(atk.weaponMax, 'weaponMax') * r1; }
+    else if (skill.kind === 'shield') { lo = num(atk.shieldPA, 'shieldPA') * r0; hi = atk.shieldPA * r1; }
+    else if (skill.kind === 'level') {
+      const b = levelScaledDamage(lvl);
+      if (skill.multRange) { lo = b * r0; hi = b * r1; } else { lo = b * (1 - c.levelRange) * mult; hi = b * (1 + c.levelRange) * mult; }
+    } else throw new Error('Unknown skill kind ' + skill.kind);
+    if (hi < lo) throw new Error('weaponMax < weaponMin');
+    const statName = skill.attr === 'weapon' ? (skill.type === 'Physical' ? ((st.STR || 0) >= (st.FIN || 0) ? 'STR' : 'FIN') : 'INT') : skill.attr;
+    const attr = skill.attr === 'none' ? 0 : Math.max(0, (st[statName] ?? c.attrBase) - c.attrBase) * c.attrPct;
+    const abil = (ab[skill.ability] || 0) * c.abilityPct;
+    const critPct = o.crit ? c.critPct : 0;
+    const weaponLike = skill.kind === 'weapon' || skill.kind === 'shield';
+    // Order per Fextralife "Damage": weapon = (1+elem)(1+attr+skill+misc)(1+hg+crit); spell = (1+elem)(1+attr)(1+misc)(1+hg+crit).
+    // Where the school ability sits for spells is unconfirmed: kept with attribute (P).
+    const factors = weaponLike
+      ? [['Elemental gear', 1 + o.gear / 100], ['Attribute+ability+weapon+misc', 1 + (attr + abil + o.weapon + o.misc) / 100], ['High ground+crit', 1 + (o.highGround + critPct) / 100]]
+      : [['Elemental gear', 1 + o.gear / 100], ['Attribute+ability+weapon', 1 + (attr + abil + o.weapon) / 100], ['Misc spell', 1 + o.misc / 100], ['High ground+crit', 1 + (o.highGround + critPct) / 100]];
+    const m = factors.reduce((p, f) => p * f[1], 1);
+    const out = [];
+    for (let i = 0; i < hits; i++) {            // each hit rolls independently
+      const roll = lo + (hi - lo) * rng(), amount = Math.max(0, rf(roll * m));
+      out.push({ roll, amount, afterResist: rf(amount * (1 - o.resist / 100)) });
+    }
+    return { kind: 'damage', type: skill.type, base: [lo, hi], hits: out, total: out.reduce((s, h) => s + h.afterResist, 0), factors: factors.map(f => ({ name: f[0], value: f[1] })), multiplier: m };
+  }
+  const damageRange = (skill, atk, opts, cfg) => ({ min: calcSkill(skill, atk, opts, () => 0, cfg).total, avg: calcSkill(skill, atk, opts, () => 0.5, cfg).total, max: calcSkill(skill, atk, opts, () => 1, cfg).total });
+  const attackerOf = a => ({ level: a.level, stats: a.stats || {}, abilities: a.abilities || {}, weaponMin: a.weapon?.min ?? 0, weaponMax: a.weapon?.max ?? 0, shieldPA: a.shieldPA ?? 0 });
+
+  // Returns a NEW target; negative amount (resistance > 100%) heals.
+  function applyDamage(t, amount, type, cfg = {}) {
+    const c = { ...CONFIG, ...cfg }, n = { ...t }; num(amount, 'amount');
+    if (amount < 0) { const h = Math.min(n.maxVitality - n.vitality, -amount); n.vitality += h; return { target: n, result: { absorbed: 0, vitality: 0, healed: h } }; }
+    if (!(type in ARMOUR)) throw new Error('Unknown damage type ' + type);
+    const pool = ARMOUR[type]; let rem = amount, abs = 0;
+    if (pool) { abs = Math.min(n[pool], rem); n[pool] -= abs; rem -= abs; if (!c.overflowToVitality && abs > 0) rem = 0; }
+    const vl = Math.min(n.vitality, rem); n.vitality -= vl; n.defeated = n.vitality <= 0;
+    return { target: n, result: { absorbed: abs, vitality: vl, healed: 0 } };
+  }
+  function applyDirect(t, amount) { const n = { ...t }, v = Math.min(n.vitality, Math.max(0, amount)); n.vitality -= v; n.defeated = n.vitality <= 0; return { target: n, result: { absorbed: 0, vitality: v, healed: 0 } }; }
+  function heal(t, amount) { const n = { ...t }, h = Math.max(0, Math.min(n.maxVitality - n.vitality, amount)); n.vitality += h; if (n.vitality > 0) n.defeated = false; return { target: n, healed: h }; }
+
+  // ---------- Turns and AP ----------
+  // T: higher initiative first; tie -> players before enemies; tie -> id (deterministic).
+  const sortInitiative = list => [...list].sort((a, b) => (b.initiative - a.initiative) || (a.type === b.type ? 0 : a.type === 'player' ? -1 : 1) || (a.id < b.id ? -1 : 1));
+  function spendAP(x, cost, override = false) {
+    num(cost, 'cost');
+    if (!override && x.ap < cost) return { ok: false, reason: `needs ${cost} AP, has ${x.ap}`, combatant: x };
+    return { ok: true, combatant: { ...x, ap: Math.max(0, x.ap - cost) } };
+  }
+
+  // Start-of-turn processing for one combatant: cooldowns tick down, statuses tick then lose a turn.
+  function startTurn(x, c) {
+    x = { ...x, statuses: (x.statuses || []).map(s => ({ ...s })), cooldowns: { ...(x.cooldowns || {}) } };
+    const events = []; let skip = false, apMod = 0;
+    for (const k of Object.keys(x.cooldowns)) if (x.cooldowns[k] > 0) x.cooldowns[k]--;
+    const keep = [];
+    for (const s of x.statuses) {
+      const def = STATUS[s.id]; if (!def) continue;
+      apMod += def.apMod || 0;
+      if (def.skipsTurn) skip = true;
+      if (def.tick && !x.defeated) {
+        const amount = Math.max(1, rf(levelScaledDamage(s.sourceLevel || x.level) * def.tick.pct));
+        const r = def.tick.bypassArmour ? applyDirect(x, amount) : applyDamage(x, amount, def.tick.type, c);
+        x = r.target;
+        events.push({ t: 'tick', id: x.id, status: s.id, amount, text: `${nm(x)} takes ${amount} ${def.tick.bypassArmour ? 'armour-ignoring' : def.tick.type} damage from ${def.name} (armour ${r.result.absorbed}, Vitality ${r.result.vitality})` });
+      }
+      s.turns--;
+      if (s.turns > 0) keep.push(s); else events.push({ t: 'expired', id: x.id, status: s.id, text: `${def.name} wears off ${nm(x)}` });
+    }
+    x.statuses = keep;
+    return { x, events, skip, apMod };
+  }
+
+  // The ONLY place AP is granted. Skips defeated and skipNext combatants. state: {round, activeId, combatants[]}
+  function nextTurn(s, cfg = {}) {
+    const c = { ...CONFIG, ...cfg }, list = s.combatants.map(x => ({ ...x })), events = [];
+    if (!list.some(x => !x.defeated)) return { state: { ...s, combatants: list }, events: [{ t: 'no-active', text: 'Nobody is able to act.' }] };
+    let i = list.findIndex(x => x.id === s.activeId), round = s.round;
+    for (let g = 0; g < list.length * 2 + 2; g++) {
+      i++; if (i >= list.length) { i = 0; round++; }
+      if (list[i].defeated) continue;
+      if (list[i].skipNext) { list[i].skipNext = false; events.push({ t: 'skipped', id: list[i].id, text: `${nm(list[i])}'s turn is skipped` }); continue; }
+      const st = startTurn(list[i], c); list[i] = st.x; events.push(...st.events);
+      const x = list[i];
+      if (x.defeated) { events.push({ t: 'defeated', id: x.id, text: `${nm(x)} is defeated` }); continue; }
+      if (st.skip) { events.push({ t: 'skipped', id: x.id, text: `${nm(x)} loses the turn (Knocked Down)` }); continue; }
+      const before = x.ap, cap = x.maxAP ?? c.maxAP;
+      if (x.ap < cap) x.ap = Math.min(cap, x.ap + Math.max(0, (x.apPerTurn ?? c.apPerTurn) + st.apMod));
+      events.push({ t: 'turn', id: x.id, round, apGained: x.ap - before, text: `Round ${round}: ${nm(x)}'s turn (+${x.ap - before} AP, now ${x.ap})` });
+      return { state: { ...s, round, activeId: x.id, combatants: list }, events };
+    }
+    return { state: { ...s, combatants: list }, events: [{ t: 'no-active', text: 'Nobody is able to act.' }] };
+  }
+
+  // ---------- Using a skill: the single path that spends AP, rolls, applies damage and statuses ----------
+  // opts: { override, crit, highGround, gear, weapon, misc }. Returns { ok, reason, state, events, results }.
+  function useSkill(state, actorId, skill, targetIds, opts = {}, rng = Math.random, cfg = {}) {
+    const c = { ...CONFIG, ...cfg }, s = clone(state), events = [], results = [];
+    const fail = reason => ({ ok: false, reason, state, events: [], results: [] });
+    const ai = s.combatants.findIndex(x => x.id === actorId); if (ai < 0) return fail('No such actor');
+    const actor = s.combatants[ai], ov = !!opts.override, ids = [...new Set(targetIds || [])];
+    if (!ov) {
+      if (actor.defeated) return fail(`${nm(actor)} is defeated`);
+      if (s.activeId && s.activeId !== actorId) return fail(`It is not ${nm(actor)}'s turn`);
+      if (actor.skills && !actor.skills.includes(skill.id)) return fail(`${nm(actor)} does not know ${skill.name}`);
+      if (actor.ap < skill.ap) return fail(`${skill.name} needs ${skill.ap} AP, ${nm(actor)} has ${actor.ap}`);
+      if ((actor.cooldowns?.[skill.id] || 0) > 0) return fail(`${skill.name} is on cooldown (${actor.cooldowns[skill.id]})`);
+      if (!ids.length) return fail('Choose at least one target');
+      if (skill.maxTargets && ids.length > skill.maxTargets) return fail(`${skill.name} hits at most ${skill.maxTargets} targets`);
+    }
+    for (const id of ids) {
+      const ti = s.combatants.findIndex(x => x.id === id); if (ti < 0) return fail('Unknown target');
+      if (s.combatants[ti].defeated && !ov) return fail(`${nm(s.combatants[ti])} is already defeated`);
+    }
+    events.push({ t: 'skill', id: actorId, text: `${nm(actor)} uses ${skill.name} (${skill.ap} AP)` });
+    const mods = Object.fromEntries(['crit', 'highGround', 'gear', 'weapon', 'misc'].filter(k => opts[k] !== undefined).map(k => [k, opts[k]]));
+    for (const id of ids) {
+      const ti = s.combatants.findIndex(x => x.id === id); let t = s.combatants[ti];
+      const res = { targetId: id, calc: null, absorbed: 0, vitality: 0, healed: 0, restored: 0, statuses: [] };
+      if (skill.kind === 'restore') {            // armour restoration: pct of the target's max armour in one pool (amount is P/T)
+        const pool = skill.pool === 'ma' ? 'ma' : 'pa', mx = pool === 'pa' ? t.maxPA : t.maxMA, add = Math.max(0, Math.min(mx - t[pool], rf(mx * (skill.pct || 0) / 100)));
+        t = { ...t, [pool]: t[pool] + add }; res.restored = add;
+        events.push({ t: 'restore', id, text: `${nm(t)} regains ${add} ${pool === 'pa' ? 'Physical' : 'Magic'} Armour` });
+      }
+      if (skill.kind !== 'utility' && skill.kind !== 'restore') {
+        const calc = calcSkill(skill, attackerOf(gearFn(s.combatants[ai])), { ...mods, resist: skill.kind === 'heal' ? 0 : totalResist(t, skill.type) }, rng, c);
+        res.calc = calc;
+        if (calc.kind === 'heal') { const h = heal(t, calc.total); t = h.target; res.healed = h.healed; events.push({ t: 'heal', id, text: `${nm(t)} heals ${h.healed} Vitality` }); }
+        else {
+          for (const h of calc.hits) { const r = applyDamage(t, h.afterResist, skill.type, c); t = r.target; res.absorbed += r.result.absorbed; res.vitality += r.result.vitality; res.healed += r.result.healed; }
+          events.push({ t: 'damage', id, text: `${nm(t)} takes ${calc.total} ${skill.type} (${calc.hits.map(h => h.afterResist).join('+')}); ${res.absorbed} armour absorbed, ${res.vitality} Vitality lost` });
+          if (t.defeated) events.push({ t: 'defeated', id, text: `${nm(t)} is defeated` });
+        }
+      }
+      if (skill.cures && !t.defeated) {
+        const before = t.statuses.length; t = removeStatuses(t, s => skill.cures.includes(s.id));
+        if (t.statuses.length < before) events.push({ t: 'cure', id, text: `${nm(t)} is cleansed (${skill.cures.map(k => STATUS[k]?.name || k).join(', ')} removed if present)` });
+      }
+      if (!t.defeated) for (const sd of skill.statuses || []) {
+        const r = applyStatus(t, sd.id, { duration: sd.duration, sourceLevel: actor.level }); t = r.target;
+        res.statuses.push({ id: sd.id, applied: r.applied, reason: r.reason });
+        events.push({ t: r.applied ? 'status' : 'resisted', id, text: r.applied ? `${nm(t)} is ${STATUS[sd.id].name}${(r.extra || []).length ? ' and ' + r.extra.map(k => STATUS[k].name).join(', ') : ''}` : `${nm(t)} resists ${STATUS[sd.id].name} (${r.reason})` });
+      }
+      s.combatants[ti] = t; results.push(res);
+    }
+    const a2 = s.combatants.findIndex(x => x.id === actorId), a = s.combatants[a2];
+    s.combatants[a2] = { ...a, ap: Math.max(0, a.ap - skill.ap), cooldowns: skill.cooldown ? { ...(a.cooldowns || {}), [skill.id]: skill.cooldown } : (a.cooldowns || {}) };
+    return { ok: true, state: s, events, results };
+  }
+
+  // ---------- Surfaces (tabletop adaptation; table lives in data.js so it is configurable) ----------
+  function resolveSurface(t, key, table) {
+    const sf = table[key]; if (!sf) throw new Error('Unknown surface ' + key);
+    if (sf.heal) { const amt = Math.max(sf.heal.min ?? 0, sf.heal.perLevel * t.level), h = heal(t, amt); return { target: h.target, events: [{ t: 'surface', id: t.id, text: `${nm(t)} heals ${h.healed} from ${sf.label}` }] }; }
+    const dmg = (sf.base || 0) + (sf.perLevel || 0) * t.level + (sf.flat || 0), events = []; let out = t;
+    if (dmg) { const r = applyDamage(t, dmg, sf.type); out = r.target; events.push({ t: 'surface', id: t.id, text: `${nm(t)} takes ${dmg} ${sf.type} from ${sf.label} (armour ${r.result.absorbed}, Vitality ${r.result.vitality})` }); if (out.defeated) events.push({ t: 'defeated', id: t.id, text: `${nm(out)} is defeated` }); }
+    else if (!sf.status) events.push({ t: 'surface', id: t.id, text: `${sf.label} has no direct effect` });
+    if (sf.status && !out.defeated) { const r = applyStatus(out, sf.status, { sourceLevel: out.level }); out = r.target; events.push({ t: r.applied ? 'status' : 'resisted', id: t.id, text: r.applied ? `${nm(out)} is ${STATUS[sf.status].name} (${sf.label})` : `${nm(out)} resists ${STATUS[sf.status].name} (${r.reason})` }); }
+    return { target: out, events };
+  }
+
+  // ---------- Combatants, templates, save format ----------
+  function normalizeCombatant(p, cfg = {}) {
+    if (!p || typeof p !== 'object') throw new TypeError('combatant must be an object');
+    const c = { ...CONFIG, ...cfg }, N = (v, d, min = -Infinity) => { const x = Number(v); return (v === '' || v === null || v === undefined || !Number.isFinite(x)) ? d : Math.max(min, x); };
+    const level = Math.floor(N(p.level, 1, 1)), maxVitality = Math.max(1, N(p.maxVitality, N(p.vitality, 100)));
+    const maxPA = N(p.maxPA, N(p.pa, 0, 0), 0), maxMA = N(p.maxMA, N(p.ma, 0, 0), 0), maxAP = N(p.maxAP, c.maxAP, 0);
+    const mapNums = o => Object.fromEntries(Object.entries(o && typeof o === 'object' ? o : {}).filter(([, v]) => Number.isFinite(Number(v))).map(([k, v]) => [k, Number(v)]));
+    const wmin = N(p.weapon?.min, 0, 0), vit = Math.min(maxVitality, N(p.vitality, maxVitality, 0));
+    return {
+      id: String(p.id || uid()), name: String(p.name || 'Unnamed').slice(0, 40), type: p.type === 'enemy' ? 'enemy' : 'player', level,
+      x: Math.floor(N(p.x, 0, 0)), y: Math.floor(N(p.y, 0, 0)), portrait: typeof p.portrait === 'string' ? p.portrait : '',
+      vitality: vit, maxVitality, pa: Math.min(maxPA, N(p.pa, maxPA, 0)), maxPA, ma: Math.min(maxMA, N(p.ma, maxMA, 0)), maxMA,
+      ap: Math.min(maxAP, N(p.ap, 0, 0)), maxAP, apPerTurn: N(p.apPerTurn, c.apPerTurn, 0), initiative: N(p.initiative, 10),
+      stats: { STR: N(p.stats?.STR, 10, 0), FIN: N(p.stats?.FIN, 10, 0), INT: N(p.stats?.INT, 10, 0) },
+      abilities: mapNums(p.abilities), weapon: { min: wmin, max: Math.max(wmin, N(p.weapon?.max, wmin, 0)) }, shieldPA: N(p.shieldPA, 0, 0),
+      resistances: mapNums(p.resistances), immune: Array.isArray(p.immune) ? p.immune.filter(i => STATUS[i]) : [], skills: Array.isArray(p.skills) ? p.skills.map(String) : [],
+      statuses: (Array.isArray(p.statuses) ? p.statuses : []).filter(s => s && STATUS[s.id] && Number(s.turns) > 0).map(s => ({ id: s.id, turns: Number(s.turns), sourceLevel: N(s.sourceLevel, level, 1) })),
+      cooldowns: mapNums(p.cooldowns), defeated: !!p.defeated || vit <= 0, skipNext: !!p.skipNext,
+      equipment: Object.fromEntries(['weapon', 'shield', 'armour', 'accessory'].filter(k => typeof p.equipment?.[k] === 'string').map(k => [k, p.equipment[k]])),
+      inventory: Array.isArray(p.inventory) ? p.inventory.filter(i => typeof i === 'string').slice(0, 200) : [],
+      base: p.base && typeof p.base === 'object' ? { maxVitality: N(p.base.maxVitality, maxVitality, 1), maxPA: N(p.base.maxPA, maxPA, 0), maxMA: N(p.base.maxMA, maxMA, 0) } : null,
+      xp: N(p.xp, 0, 0), points: { attr: Math.floor(N(p.points?.attr, 0, 0)), combat: Math.floor(N(p.points?.combat, 0, 0)) },
+      hidden: !!p.hidden, rewarded: !!p.rewarded, xpReward: p.xpReward == null ? null : N(p.xpReward, 0, 0), loot: typeof p.loot === 'string' ? p.loot : '',
+      notes: typeof p.notes === 'string' ? p.notes.slice(0, 2000) : '', surfStamp: typeof p.surfStamp === 'string' ? p.surfStamp : ''
+    };
+  }
+
+  // tpl: {name, vit, pa, ma, attrs:{STR,FIN,INT}, abilities:{k:v}, skills[], initiative, weapon:[lo,hi] as share of levelScaledDamage}
+  function buildEnemy(tpl, level, id) {
+    const l = levelScaledDamage(level), w = tpl.weapon || [0.9, 1.1];
+    return normalizeCombatant({
+      id, name: tpl.name, type: 'enemy', level,
+      maxVitality: npcVitality(level, tpl.vit), maxPA: npcArmour(level, tpl.pa), maxMA: npcArmour(level, tpl.ma), apPerTurn: tpl.apPerTurn,
+      stats: Object.fromEntries(Object.entries(tpl.attrs).map(([k, v]) => [k, npcAttribute(v, level)])),
+      abilities: Object.fromEntries(Object.entries(tpl.abilities || {}).map(([k, v]) => [k, npcAbility(v, level)])),
+      weapon: { min: rf(l * w[0]), max: rf(l * w[1]) }, shieldPA: tpl.shield ? npcArmour(level, tpl.shield) : 0,
+      skills: tpl.skills, initiative: tpl.initiative ?? 10, resistances: tpl.resistances
+    });
+  }
+
+  function createHistory(limit = 100) {
+    const stack = [];
+    return { push(s) { stack.push(JSON.stringify(s)); if (stack.length > limit) stack.shift(); }, undo() { return stack.length ? JSON.parse(stack.pop()) : null; }, size: () => stack.length, clear() { stack.length = 0; } };
+  }
+
+  function migrateV1(d) {
+    const combatants = (Array.isArray(d.combatants) ? d.combatants : []).map(c => ({ ...c, maxPA: c.pa, maxMA: c.ma }));
+    const surfaces = {}; (Array.isArray(d.tiles) ? d.tiles : []).forEach(t => { if (t && t.surface) surfaces[`${t.x},${t.y}`] = t.surface; });
+    return { format: 'battleboard-v2', name: d.name, cols: d.cols, rows: d.rows, surfaces, log: [], settings: {}, state: { round: d.round, activeId: combatants[d.turnIndex]?.id ?? null, combatants } };
+  }
+  function serializeSave(x) { return { format: 'battleboard-v2', version: 2, name: x.name, cols: x.cols, rows: x.rows, surfaces: x.surfaces, log: x.log, settings: x.settings, state: x.state, dm: x.dm }; }
+  // Throws on malformed input. validSurfaces: list of allowed surface keys. Returns a clean, normalised encounter plus warnings.
+  function loadSave(raw, validSurfaces = []) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Not an encounter file');
+    let d = raw; if (d.format === 'battleboard-v1') d = migrateV1(d);
+    if (d.format !== 'battleboard-v2') throw new Error('Unsupported file format');
+    const cols = Number(d.cols), rows = Number(d.rows), warnings = [];
+    if (!Number.isInteger(cols) || cols < 6 || cols > 30 || !Number.isInteger(rows) || rows < 6 || rows > 24) throw new Error('Grid size is missing or out of range');
+    const st = d.state; if (!st || !Array.isArray(st.combatants)) throw new Error('Missing combatants');
+    if (st.combatants.length > 200) throw new Error('Too many combatants');
+    const seen = new Set(), taken = new Set(), combatants = [];
+    for (const raw of st.combatants) {
+      const c = normalizeCombatant(raw, d.settings || {});
+      if (seen.has(c.id)) { c.id = uid(); warnings.push(`Duplicate id for ${c.name} replaced`); }
+      seen.add(c.id); c.x = Math.min(cols - 1, c.x); c.y = Math.min(rows - 1, c.y);
+      if (taken.has(`${c.x},${c.y}`)) { // move to the nearest free tile
+        let placed = false; for (let k = 0; k < cols * rows && !placed; k++) { const x = k % cols, y = Math.floor(k / cols); if (!taken.has(`${x},${y}`)) { c.x = x; c.y = y; placed = true; } }
+        warnings.push(`${c.name} shared a tile and was moved`);
+      }
+      taken.add(`${c.x},${c.y}`); combatants.push(c);
+    }
+    const surfaces = {}; let dropped = 0;
+    for (const [k, v] of Object.entries(d.surfaces && typeof d.surfaces === 'object' ? d.surfaces : {})) {
+      const m = /^(\d+),(\d+)$/.exec(k);
+      if (m && +m[1] < cols && +m[2] < rows && validSurfaces.includes(v)) surfaces[k] = v; else dropped++;
+    }
+    if (dropped) warnings.push(`${dropped} invalid surface tile(s) dropped`);
+    const round = Number.isInteger(Number(st.round)) && Number(st.round) >= 1 ? Number(st.round) : 1;
+    const s = d.settings || {}, num0 = (v, dflt) => Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : dflt;
+    return {
+      name: String(d.name || 'Imported encounter').slice(0, 80), cols, rows, surfaces,
+      state: { round, activeId: combatants.some(c => c.id === st.activeId) ? st.activeId : null, combatants },
+      log: (Array.isArray(d.log) ? d.log : []).slice(-500).map(String),
+      settings: { apPerTurn: num0(s.apPerTurn, CONFIG.apPerTurn), maxAP: num0(s.maxAP, CONFIG.maxAP), autoSurfaces: s.autoSurfaces !== false },
+      dm: d.dm && typeof d.dm === 'object' && !Array.isArray(d.dm) ? d.dm : null, warnings
+    };
+  }
+
+  return { CONFIG, ARMOUR, STATUS, mulberry32, vitalityBoost, levelScaledDamage, healScaling, npcVitality, npcArmour, npcAttribute, npcAbility,
+    calcSkill, damageRange, attackerOf, applyDamage, applyDirect, heal, applyStatus, removeStatuses, cleanseBy, setGear, statusResist, totalResist, rf,
+    sortInitiative, spendAP, nextTurn, useSkill, resolveSurface, normalizeCombatant, buildEnemy, createHistory, serializeSave, loadSave, uid };
+});
+
+</script>
+<script>
+/* Game data, kept separate from engine and UI. Edit this file to add skills, enemies or surfaces.
+   verified: 'sourced' = AP, cooldown, multiplier and effects copied from the cited page (community guide, DE);
+             the damage formula applied to them is still partly provisional (see AUDIT.md).
+   Skill sources: GS = GameFAQs DOS2 skills guide https://gamefaqs.gamespot.com/ps5/603846-divinity-original-sin-ii/faqs/81674/skills
+                  DW = https://dos2.wiki/wiki/Fossil_Strike */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.DOS2DATA = factory();
+})(this, function () {
+  const W = (id, name, ap, cooldown, mult, extra = {}) => ({ id, name, school: 'Warfare', kind: 'weapon', type: 'Physical', attr: 'weapon', ability: 'warfare', ap, cooldown, mult, verified: 'sourced', source: 'GS', ...extra });
+  const F = (id, name, ap, cooldown, mult, extra = {}) => ({ id, name, school: 'Pyrokinetic', kind: 'level', type: 'Fire', attr: 'INT', ability: 'pyrokinetic', ap, cooldown, mult, verified: 'sourced', source: 'GS', ...extra });
+
+  const SKILLS = [
+    W('battering-ram', 'Battering Ram', 2, 5, 0.5, { statuses: [{ id: 'knockedDown' }], notes: 'Hits enemies in its path. Knockdown only if Physical Armour is 0.' }),
+    W('battle-stomp', 'Battle Stomp', 2, 4, 0.9, { statuses: [{ id: 'knockedDown' }], notes: 'Enemies in front. Surface clearing not simulated.' }),
+    W('bouncing-shield', 'Bouncing Shield', 2, 2, 1.6, { kind: 'shield', attr: 'none', maxTargets: 2, notes: '160% of the shield\'s Physical Armour; bounces to a second enemy within 5 m.' }),
+    W('crippling-blow', 'Crippling Blow', 2, 3, 1.15, { statuses: [{ id: 'crippled' }], notes: 'Target and adjacent enemies (choose them all).' }),
+    W('whirlwind', 'Whirlwind', 2, 3, 1.0, { notes: 'All surrounding enemies (choose them all).' }),
+    W('blitz-attack', 'Blitz Attack', 2, 3, 0.7, { maxTargets: 2, notes: '2 random enemies within 10 m; choose up to 2.' }),
+    W('onslaught', 'Onslaught', 4, 6, 0.5, { hits: 5, notes: '5 hits. Source Point cost (2) is not tracked.' }),
+    W('overpower', 'Overpower', 2, 1, 1.5, { statuses: [{ id: 'knockedDown' }], notes: 'The Physical Armour-destroying part is not simulated.' }),
+    { id: 'haste', name: 'Haste', school: 'Pyrokinetic', kind: 'utility', type: 'Magic', ap: 1, cooldown: 3, statuses: [{ id: 'hasted' }], verified: 'sourced', source: 'GS', notes: 'Target an ally. Clears Crippled and Slowed.' },
+    F('searing-daggers', 'Searing Daggers', 2, 3, 0.25, { hits: 3, statuses: [{ id: 'burning' }], notes: '3 daggers at 25% each, modelled on one target.' }),
+    F('fireball', 'Fireball', 2, 4, 1.0, { statuses: [{ id: 'burning' }], notes: '3 m radius: choose every target in the area.' }),
+    F('supernova', 'Supernova', 3, 6, 1.75, { statuses: [{ id: 'burning' }], notes: '4 m radius.' }),
+    F('laser-ray', 'Laser Ray', 3, 3, 1.5, { statuses: [{ id: 'burning' }], notes: 'Line. Fire clouds not simulated.' }),
+    F('fire-whip', 'Fire Whip', 3, 3, 1.2, { statuses: [{ id: 'burning', duration: 1 }], notes: 'Blinded not modelled.' }),
+    { id: 'cleanse-wounds', name: 'Cleanse Wounds', school: 'Hydrosophist', kind: 'heal', type: 'Heal', ap: 2, cooldown: 3, healValue: 100, cures: ['burning', 'poisoned', 'bleeding'], verified: 'provisional', source: 'FW',
+      notes: 'AP 2 and "heals target, removes Burning/Poisoned/Bleeding" per the OS2 wiki Warfare page (craftable list). Heal value 100 and cooldown 3 are P. The water puddle is not created (use the surface brush).' },
+    { id: 'deflective-barrier', name: 'Deflective Barrier', school: 'Warfare', kind: 'restore', type: 'Physical', pool: 'pa', pct: 50, ap: 2, cooldown: 4, verified: 'provisional', source: 'FW',
+      notes: 'AP 2 and "grants Physical Armour" per the OS2 wiki Warfare page; the amount is not published, so 50% of max PA and cooldown 4 are P. Projectile reflection is not simulated.' },
+    { id: 'fossil-strike', name: 'Fossil Strike', school: 'Geomancer', kind: 'level', type: 'Earth', attr: 'INT', ability: 'geomancer', ap: 2, cooldown: 3, multRange: [0.8, 0.9], verified: 'sourced', source: 'DW',
+      notes: '13 m range, 2 m radius. Oil surface and 2-turn Slow are not simulated (use the surface brush). "80-90%" read as a damage range: P.' }
+  ];
+
+  // Enemy archetypes (original names). vit/pa/ma are % of the level-scaled value (Formulas.md); attrs use the level-mapped attribute formula.
+  const ENEMIES = [
+    { id: 'brute', name: 'Raider Brute', vit: 110, pa: 140, ma: 20, attrs: { STR: 60, FIN: 20, INT: 10 }, abilities: { warfare: 8 }, skills: ['battering-ram', 'battle-stomp', 'crippling-blow'], initiative: 8 },
+    { id: 'pyromancer', name: 'Cultist Pyromancer', vit: 80, pa: 20, ma: 140, attrs: { STR: 10, FIN: 20, INT: 60 }, abilities: { pyrokinetic: 8 }, skills: ['fireball', 'searing-daggers', 'haste'], initiative: 12 },
+    { id: 'skirmisher', name: 'Skirmisher', vit: 90, pa: 80, ma: 60, attrs: { STR: 30, FIN: 50, INT: 10 }, abilities: { warfare: 6 }, skills: ['blitz-attack', 'whirlwind'], initiative: 14 },
+    { id: 'warden', name: 'Stone Warden', vit: 150, pa: 200, ma: 100, attrs: { STR: 50, FIN: 10, INT: 30 }, abilities: { warfare: 7, geomancer: 6 }, skills: ['bouncing-shield', 'overpower', 'fossil-strike'], shield: 100, initiative: 6 }
+  ];
+
+  ENEMIES.push(
+    { id: 'healer', name: 'Temple Cleric', vit: 90, pa: 40, ma: 110, attrs: { STR: 10, FIN: 20, INT: 50 }, abilities: { pyrokinetic: 4 }, skills: ['cleanse-wounds', 'haste', 'fireball'], initiative: 11, loot: 'humanoid' },
+    { id: 'guard', name: 'Barricade Guard', vit: 130, pa: 170, ma: 40, attrs: { STR: 50, FIN: 20, INT: 10 }, abilities: { warfare: 6 }, skills: ['deflective-barrier', 'crippling-blow', 'whirlwind'], shield: 80, initiative: 7, loot: 'soldier' }
+  );
+  ENEMIES.forEach(e => { if (!e.loot) e.loot = e.id === 'warden' ? 'boss' : e.id === 'pyromancer' ? 'humanoid' : 'soldier'; });
+
+  // Tabletop adaptation (T), per your rules: ordinary hazards flat, cursed scales with level, blessed heals by level. All configurable.
+  const SURFACES = {
+    fire: { label: 'Fire', type: 'Fire', flat: 12, status: 'burning' },
+    poison: { label: 'Poison', type: 'Poison', flat: 10, status: 'poisoned' },
+    water: { label: 'Water', status: 'wet' },
+    oil: { label: 'Oil' },
+    electric: { label: 'Electrified Water', type: 'Air', flat: 14, status: 'shocked' },
+    'cursed-fire': { label: 'Cursed Fire', type: 'Fire', base: 8, perLevel: 12, status: 'burning' },
+    blessed: { label: 'Blessed Surface', heal: { perLevel: 10, min: 1 } }
+  };
+
+  // Surface interaction matrix, keyed 'existing+incoming'. null result = surface removed. All entries are P/T: behaviour follows DOS2 as I know it,
+  // but no fetched source confirmed the table. Anything not listed simply replaces the old surface.
+  const INTERACTIONS = {
+    'oil+fire': ['fire', 'The oil ignites.'], 'fire+oil': ['fire', 'The oil ignites.'],
+    'poison+fire': ['fire', 'The poison burns off (explosion not simulated).'], 'fire+poison': ['fire', 'The poison burns off (explosion not simulated).'],
+    'water+fire': [null, 'The fire is put out (steam not simulated).'], 'fire+water': [null, 'The fire is put out (steam not simulated).'],
+    'water+electric': ['electric', 'The water is electrified.'], 'electric+water': ['electric', 'The water stays electrified.'],
+    'oil+cursed-fire': ['cursed-fire', 'The oil ignites with cursed fire.'], 'poison+cursed-fire': ['cursed-fire', 'The poison burns with cursed fire.'],
+    'water+cursed-fire': ['cursed-fire', 'Water cannot douse cursed fire (T).'], 'cursed-fire+water': ['cursed-fire', 'Water cannot douse cursed fire (T).'],
+    'cursed-fire+blessed': ['fire', 'The blessing cleanses the curse; ordinary fire remains.'], 'blessed+cursed-fire': ['fire', 'The blessing cleanses the curse; ordinary fire remains.']
+  };
+
+  // Skill geometry (P unless the skill's own notes cite a figure). 1 tile = 1 m. shape: single | radius (around the aimed tile) | around (the actor) | line | pick (nearest N).
+  // range 'weapon' = the equipped weapon's reach. friendlyFire: area hits allies too (DOS2-like for elemental AoE).
+  const GEOM = {
+    'battering-ram': { shape: 'line', size: 6, targets: 'enemy' }, 'battle-stomp': { shape: 'line', size: 3, targets: 'enemy' },
+    'bouncing-shield': { shape: 'pick', range: 8, targets: 'enemy' }, 'crippling-blow': { shape: 'radius', size: 1.5, range: 'weapon', targets: 'enemy' },
+    'whirlwind': { shape: 'around', size: 1.5, targets: 'enemy' }, 'blitz-attack': { shape: 'pick', range: 10, targets: 'enemy', cited: true },
+    'onslaught': { shape: 'single', range: 'weapon', targets: 'enemy' }, 'overpower': { shape: 'single', range: 'weapon', targets: 'enemy' },
+    'haste': { shape: 'single', range: 13, targets: 'ally' }, 'searing-daggers': { shape: 'single', range: 13, targets: 'enemy' },
+    'fireball': { shape: 'radius', size: 3, range: 13, targets: 'enemy', friendlyFire: true, cited: true }, 'supernova': { shape: 'radius', size: 4, range: 13, targets: 'enemy', friendlyFire: true, cited: true },
+    'laser-ray': { shape: 'line', size: 10, targets: 'enemy' }, 'fire-whip': { shape: 'single', range: 5, targets: 'enemy' },
+    'fossil-strike': { shape: 'radius', size: 2, range: 13, targets: 'enemy', friendlyFire: true, cited: true },
+    'cleanse-wounds': { shape: 'single', range: 8, targets: 'ally' }, 'deflective-barrier': { shape: 'single', range: 0, targets: 'self' }
+  };
+
+  // Equipment. Gear scales with the wearer's level (T): weapon damage = share of levelScaledDamage; armour values use the same level scaling as enemy templates.
+  const ITEMS = {
+    'iron-sword': { name: 'Iron Sword', slot: 'weapon', dmg: [0.9, 1.1], range: 1.5, attr: 'STR' },
+    'war-axe': { name: 'War Axe', slot: 'weapon', dmg: [1.1, 1.4], range: 1.5, attr: 'STR', twoHanded: true },
+    'dagger': { name: 'Steel Dagger', slot: 'weapon', dmg: [0.7, 0.9], range: 1.5, attr: 'FIN', attrs: { FIN: 1 } },
+    'recurve-bow': { name: 'Recurve Bow', slot: 'weapon', dmg: [0.85, 1.05], range: 8, attr: 'FIN', twoHanded: true },
+    'ash-staff': { name: 'Ash Staff', slot: 'weapon', dmg: [0.8, 1.0], range: 6, attr: 'INT', attrs: { INT: 2 }, twoHanded: true },
+    'round-shield': { name: 'Round Shield', slot: 'shield', paPct: 60 },
+    'tower-shield': { name: 'Tower Shield', slot: 'shield', paPct: 110, attrs: { FIN: -1 } },
+    'leather-vest': { name: 'Leather Vest', slot: 'armour', paPct: 50, maPct: 30 },
+    'plate-cuirass': { name: 'Plate Cuirass', slot: 'armour', paPct: 120, maPct: 20, attrs: { FIN: -1 } },
+    'scholar-robe': { name: "Scholar's Robe", slot: 'armour', paPct: 20, maPct: 110, attrs: { INT: 1 } },
+    'ember-ring': { name: 'Ember Ring', slot: 'accessory', resist: { Fire: 20 } },
+    'frost-charm': { name: 'Frost Charm', slot: 'accessory', resist: { Water: 20 } },
+    'ward-amulet': { name: 'Ward Amulet', slot: 'accessory', resist: { Poison: 20, Earth: 10 } },
+    'vital-band': { name: 'Band of Vitality', slot: 'accessory', vitPct: 25 }
+  };
+  const LOOT = {
+    humanoid: { gold: [4, 9], drops: [{ item: 'scholar-robe', chance: 0.15 }, { item: 'ember-ring', chance: 0.2 }, { item: 'ash-staff', chance: 0.15 }] },
+    soldier: { gold: [5, 12], drops: [{ item: 'iron-sword', chance: 0.25 }, { item: 'round-shield', chance: 0.2 }, { item: 'leather-vest', chance: 0.2 }, { item: 'dagger', chance: 0.1 }] },
+    boss: { gold: [25, 40], drops: [{ item: 'tower-shield', chance: 0.6 }, { item: 'plate-cuirass', chance: 0.5 }, { item: 'war-axe', chance: 0.5 }, { item: 'vital-band', chance: 0.4 }] }
+  };
+  // XP needed to reach each level: copied from the Fextralife DOS2 "Experience" page (fetched). Level 35 is the last row on that page.
+  const XP_TABLE = [0, 0, 2000, 8000, 20000, 40000, 70000, 112000, 168000, 240000, 340000, 479000, 672000, 941000, 1315000, 1834000, 2556000, 3559000, 4954000, 6893000, 9588000, 13334000, 18540000, 25777000, 35836000, 49818000, 69253000, 96268000, 133818000, 186013000, 258564000, 359410000, 499586000, 694430000, 965264000, 1341723000];
+  // Tabletop progression settings. The wiki page does not state points per level, so these are P and configurable.
+  const PROGRESSION = { maxLevel: 21, killXpDivisor: 8, attrPointsPerLevel: 2, combatPointsPerLevel: 1, abilityCap: 10 };
+
+  return { SKILLS, ENEMIES, SURFACES, INTERACTIONS, GEOM, ITEMS, LOOT, XP_TABLE, PROGRESSION };
+});
+
+</script>
+<script>
+/* World rules layered on the engine: targeting geometry, surface interactions and triggers, equipment, XP and levelling, loot, DM data.
+   Pure functions: state in, new state out. Needs engine.js (DOS2) and data.js (DOS2DATA). */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./engine.js'), require('./data.js'));
+  else root.DOS2WORLD = factory(root.DOS2, root.DOS2DATA);
+})(this, function (E, D) {
+  const rf = E.rf, clone = o => JSON.parse(JSON.stringify(o)), SLOTS = ['weapon', 'shield', 'armour', 'accessory'];
+  const nm = c => c.name, key = (x, y) => `${x},${y}`;
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // ---------- Equipment (gear is never merged into base stats) ----------
+  const itemsOf = c => SLOTS.map(s => D.ITEMS[c.equipment?.[s]]).filter(Boolean);
+  // The combatant as the damage engine should see it: gear attributes, weapon damage, shield value and resistances applied on top of the base record.
+  function gearView(c) {
+    const its = itemsOf(c), v = { ...c, stats: { ...c.stats }, resistances: { ...c.resistances } };
+    for (const it of its) {
+      for (const [k, n] of Object.entries(it.attrs || {})) v.stats[k] = Math.max(0, (v.stats[k] ?? 10) + n);
+      for (const [k, n] of Object.entries(it.resist || {})) v.resistances[k] = (v.resistances[k] || 0) + n;
+    }
+    const w = D.ITEMS[c.equipment?.weapon]; if (w) { const l = E.levelScaledDamage(c.level); v.weapon = { min: rf(l * w.dmg[0]), max: rf(l * w.dmg[1]) }; }
+    const sh = D.ITEMS[c.equipment?.shield]; if (sh) v.shieldPA = E.npcArmour(c.level, sh.paPct);
+    return v;
+  }
+  E.setGear(gearView);
+  const gearBonus = c => { const b = { maxVitality: 0, maxPA: 0, maxMA: 0 }; for (const it of itemsOf(c)) { if (it.vitPct) b.maxVitality += E.npcVitality(c.level, it.vitPct); if (it.paPct) b.maxPA += E.npcArmour(c.level, it.paPct); if (it.maPct) b.maxMA += E.npcArmour(c.level, it.maPct); } return b; };
+  const withBase = c => c.base ? c : { ...c, base: { maxVitality: c.maxVitality, maxPA: c.maxPA, maxMA: c.maxMA } };
+  // Recompute maximums as base + gear; current values are clamped, never topped up.
+  function recalc(c) {
+    c = withBase(c); const g = gearBonus(c), maxVitality = Math.max(1, c.base.maxVitality + g.maxVitality), maxPA = c.base.maxPA + g.maxPA, maxMA = c.base.maxMA + g.maxMA;
+    const vitality = Math.min(c.vitality, maxVitality);
+    return { ...c, maxVitality, maxPA, maxMA, vitality, pa: Math.min(c.pa, maxPA), ma: Math.min(c.ma, maxMA), defeated: vitality <= 0 };
+  }
+  // The UI edits a displayed maximum; store it as base = desired - gear so gear stays separate.
+  function setMax(c, which, desired) { c = withBase(c); c = { ...c, base: { ...c.base, [which]: Math.max(which === 'maxVitality' ? 1 : 0, Math.round(desired - gearBonus(c)[which])) } }; return recalc(c); }
+
+  function equip(c, itemId) {
+    const it = D.ITEMS[itemId]; if (!it) throw new Error('Unknown item ' + itemId);
+    if (!(c.inventory || []).includes(itemId)) throw new Error(`${nm(c)} does not carry ${it.name}`);
+    let inv = [...c.inventory], eq = { ...c.equipment };
+    inv.splice(inv.indexOf(itemId), 1);
+    const bump = slot => { if (eq[slot]) { inv.push(eq[slot]); delete eq[slot]; } };
+    bump(it.slot);
+    if (it.slot === 'weapon' && it.twoHanded) bump('shield');                                  // two-handers exclude a shield
+    if (it.slot === 'shield' && D.ITEMS[eq.weapon]?.twoHanded) bump('weapon');
+    eq[it.slot] = itemId; return recalc({ ...c, inventory: inv, equipment: eq });
+  }
+  function unequip(c, slot) { const id = c.equipment?.[slot]; if (!id) return c; const eq = { ...c.equipment }; delete eq[slot]; return recalc({ ...c, equipment: eq, inventory: [...c.inventory, id] }); }
+  const weaponRange = c => D.ITEMS[c.equipment?.weapon]?.range ?? 1.5;
+
+  // ---------- Geometry and targeting ----------
+  function areaTiles(shape, size, from, aim, cols, rows) {
+    const inb = (x, y) => x >= 0 && y >= 0 && x < cols && y < rows, out = [];
+    if (shape === 'single') return inb(aim.x, aim.y) ? [{ x: aim.x, y: aim.y }] : [];
+    if (shape === 'radius' || shape === 'around') { const c = shape === 'around' ? from : aim; for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) if (Math.hypot(x - c.x, y - c.y) <= size + 1e-9) out.push({ x, y }); return out; }
+    if (shape === 'line') {
+      const dx = aim.x - from.x, dy = aim.y - from.y, len = Math.hypot(dx, dy); if (!len) return [];
+      const seen = new Set();
+      for (let s = 0.5; s <= size + 1e-9; s += 0.5) { const x = Math.round(from.x + dx / len * s), y = Math.round(from.y + dy / len * s); if (inb(x, y) && !(x === from.x && y === from.y) && !seen.has(key(x, y))) { seen.add(key(x, y)); out.push({ x, y }); } }
+      return out;
+    }
+    return out;
+  }
+  function geomFor(skill, actor) {
+    const g = { shape: 'single', targets: skill.kind === 'heal' || skill.kind === 'utility' ? 'ally' : 'enemy', range: 'weapon', size: 0, friendlyFire: false, ...(D.GEOM[skill.id] || {}) };
+    g.range = g.range === 'weapon' ? weaponRange(actor) : g.range; return g;
+  }
+  const teamOK = (rule, actor, c) => rule === 'any' || (rule === 'enemy' && c.type !== actor.type) || (rule === 'ally' && c.type === actor.type) || (rule === 'self' && c.id === actor.id);
+  // aim: {x,y}. Returns {ok, reason, tiles, targetIds, range}. Range is checked here, not in useSkill; the GM override simply ignores a failed plan.
+  function planCast(state, actorId, skill, aim, cols, rows) { const r = planCastRaw(state, actorId, skill, aim, cols, rows); if (!r.candidateIds) r.candidateIds = r.targetIds; return r; }
+  function planCastRaw(state, actorId, skill, aim, cols, rows) {
+    const actor = state.combatants.find(c => c.id === actorId); if (!actor) return { ok: false, reason: 'No such actor', tiles: [], targetIds: [] };
+    const g = geomFor(skill, actor), live = state.combatants.filter(c => !c.defeated), fail = reason => ({ ok: false, reason, tiles: [], targetIds: [], range: g.range, shape: g.shape });
+    const needsAim = g.shape !== 'around' && g.targets !== 'self'; if (needsAim && !aim) return fail('Click a tile to aim');
+    if (g.targets === 'self') return { ok: true, tiles: [{ x: actor.x, y: actor.y }], targetIds: [actor.id], range: 0, shape: g.shape };
+    if (g.shape === 'around') { const tiles = areaTiles('around', g.size, actor, actor, cols, rows); return { ok: true, tiles, targetIds: live.filter(c => c.id !== actor.id && teamOK(g.targets, actor, c) && tiles.some(t => t.x === c.x && t.y === c.y)).map(c => c.id), range: g.size, shape: g.shape }; }
+    if (g.shape === 'line') {
+      if (aim.x === actor.x && aim.y === actor.y) return fail('Aim at a different tile');
+      const tiles = areaTiles('line', g.size, actor, aim, cols, rows);
+      return { ok: true, tiles, targetIds: live.filter(c => c.id !== actor.id && teamOK(g.targets, actor, c) && tiles.some(t => t.x === c.x && t.y === c.y)).map(c => c.id), range: g.size, shape: g.shape };
+    }
+    if (g.shape === 'pick') {
+      const cand = live.filter(c => c.id !== actor.id && teamOK(g.targets, actor, c) && dist(actor, c) <= g.range + 1e-9).sort((a, b) => dist(actor, a) - dist(actor, b) || (a.id < b.id ? -1 : 1));
+      if (!cand.length) return fail(`No valid target within ${g.range} tiles`);
+      return { ok: true, candidateIds: cand.map(c => c.id), tiles: cand.map(c => ({ x: c.x, y: c.y })), targetIds: cand.slice(0, skill.maxTargets || 1).map(c => c.id), range: g.range, shape: g.shape };
+    }
+    const d = dist(actor, aim); if (d > g.range + 1e-9) return fail(`Out of range (${d.toFixed(1)} > ${g.range})`);
+    if (g.shape === 'single') {
+      const t = live.find(c => c.x === aim.x && c.y === aim.y); if (!t) return fail('No combatant on that tile');
+      if (!teamOK(g.targets, actor, t)) return fail(`${skill.name} needs ${g.targets === 'ally' ? 'an ally' : 'an enemy'}`);
+      return { ok: true, tiles: [{ x: aim.x, y: aim.y }], targetIds: [t.id], range: g.range, shape: g.shape };
+    }
+    const tiles = areaTiles('radius', g.size, actor, aim, cols, rows);
+    return { ok: true, tiles, targetIds: live.filter(c => tiles.some(t => t.x === c.x && t.y === c.y) && (g.friendlyFire || teamOK(g.targets, actor, c))).map(c => c.id), range: g.range, shape: g.shape };
+  }
+
+  // ---------- Surfaces ----------
+  // Painting or creating a surface over another one goes through the interaction table. Returns the new map and a message (or null).
+  function placeSurface(surfaces, x, y, type) {
+    const k = key(x, y), old = surfaces[k], next = { ...surfaces }; let note = null, result = type;
+    if (old && old === type) return { surfaces, note: null };
+    const rule = old && D.INTERACTIONS[`${old}+${type}`]; if (rule) { result = rule[0]; note = rule[1]; }
+    if (result) next[k] = result; else delete next[k];
+    return { surfaces: next, note };
+  }
+  // A surface triggers at most once per combatant, trigger, tile and turn window (stamp). Returns {state, events}.
+  function triggerSurface(state, surfaces, id, trigger) {
+    const i = state.combatants.findIndex(c => c.id === id); if (i < 0) return { state, events: [] };
+    const c = state.combatants[i], sf = surfaces[key(c.x, c.y)]; if (!sf || c.defeated) return { state, events: [] };
+    const def = D.SURFACES[sf]; if (!(def.triggers || ['enter', 'start']).includes(trigger)) return { state, events: [] };
+    const stamp = `${state.round}|${state.activeId}|${trigger}|${key(c.x, c.y)}|${sf}`; if (c.surfStamp === stamp) return { state, events: [] };
+    const r = E.resolveSurface(c, sf, D.SURFACES), combatants = state.combatants.slice(); combatants[i] = { ...r.target, surfStamp: stamp };
+    return { state: { ...state, combatants }, events: r.events };
+  }
+
+  // ---------- XP and levelling ----------
+  const P = D.PROGRESSION, XP = D.XP_TABLE;
+  const xpFor = level => XP[Math.max(1, Math.min(level, XP.length - 1))];
+  const levelForXp = xp => { let l = 1; while (l < P.maxLevel && xp >= xpFor(l + 1)) l++; return l; };
+  const killXp = level => Math.max(1, Math.floor((xpFor(Math.min(level + 1, XP.length - 1)) - xpFor(level)) / P.killXpDivisor));
+  const armourRatio = (a, b) => (E.vitalityBoost(b) * (1 + b * 0.07)) / (E.vitalityBoost(a) * (1 + a * 0.07));
+  function grantXp(c, amount) {
+    if (!(amount >= 0) || !Number.isFinite(amount)) throw new Error('XP must be a non-negative number');
+    c = withBase(c); const xp = Math.max(c.xp || 0, xpFor(c.level)) + Math.floor(amount), to = levelForXp(xp), events = [];
+    if (to <= c.level) return { c: { ...c, xp }, events, gained: 0 };
+    const from = c.level, vr = E.vitalityBoost(to) / E.vitalityBoost(from), ar = armourRatio(from, to), up = to - from, old = c;
+    const base = { maxVitality: rf(c.base.maxVitality * vr), maxPA: rf(c.base.maxPA * ar), maxMA: rf(c.base.maxMA * ar) };
+    let n = recalc({ ...c, xp, level: to, base, points: { attr: c.points.attr + up * P.attrPointsPerLevel, combat: c.points.combat + up * P.combatPointsPerLevel } });
+    const oldMax = { v: old.maxVitality, pa: old.maxPA, ma: old.maxMA };          // keep the same missing amount: level-up adds the growth to current values
+    n = { ...n, vitality: Math.min(n.maxVitality, c.vitality + (n.maxVitality - oldMax.v)), pa: Math.min(n.maxPA, c.pa + (n.maxPA - oldMax.pa)), ma: Math.min(n.maxMA, c.ma + (n.maxMA - oldMax.ma)) };
+    events.push({ t: 'level', id: c.id, text: `${nm(c)} reaches level ${to}! (+${up * P.attrPointsPerLevel} attribute, +${up * P.combatPointsPerLevel} combat points)` });
+    return { c: n, events, gained: up };
+  }
+  function spendPoint(c, kind, name) {
+    if (kind === 'attr') { if (!['STR', 'FIN', 'INT'].includes(name)) throw new Error('Unknown attribute'); if (c.points.attr < 1) throw new Error('No attribute points left'); return { ...c, stats: { ...c.stats, [name]: c.stats[name] + 1 }, points: { ...c.points, attr: c.points.attr - 1 } }; }
+    if (kind === 'combat') { if (c.points.combat < 1) throw new Error('No combat points left'); if ((c.abilities[name] || 0) >= P.abilityCap) throw new Error('Ability is at its cap'); return { ...c, abilities: { ...c.abilities, [name]: (c.abilities[name] || 0) + 1 }, points: { ...c.points, combat: c.points.combat - 1 } }; }
+    throw new Error('Unknown point type');
+  }
+
+  // ---------- Loot and rewards ----------
+  function rollLoot(tableId, level, rng) {
+    const t = D.LOOT[tableId]; if (!t) return { gold: 0, items: [] };
+    const gold = rf((t.gold[0] + Math.floor(rng() * (t.gold[1] - t.gold[0] + 1))) * Math.max(1, level) * 0.5 + 0.0001);
+    return { gold, items: t.drops.filter(d => rng() < d.chance).map(d => d.item) };
+  }
+  const emptyDm = () => ({ pendingXp: 0, pendingLoot: [], gold: 0, npcs: [], quests: [], session: '', encNotes: '' });
+  // Each defeated enemy pays out exactly once (c.rewarded). Mutations are returned, not applied in place.
+  function collectRewards(state, dm, rng) {
+    const events = []; let out = { ...dm, pendingLoot: [...dm.pendingLoot] }; const combatants = state.combatants.map(c => {
+      if (c.type !== 'enemy' || !c.defeated || c.rewarded) return c;
+      const xp = c.xpReward ?? killXp(c.level), l = rollLoot(c.loot, c.level, rng);
+      out.pendingXp += xp; out.gold += l.gold; out.pendingLoot.push(...l.items);
+      events.push({ t: 'reward', id: c.id, text: `${nm(c)} defeated: ${xp} XP, ${l.gold} gold${l.items.length ? ', loot: ' + l.items.map(i => D.ITEMS[i].name).join(', ') : ''}` });
+      return { ...c, rewarded: true };
+    });
+    return { state: events.length ? { ...state, combatants } : state, dm: out, events };
+  }
+  function distributeXp(state, dm) {
+    const heirs = state.combatants.filter(c => c.type === 'player' && !c.defeated), events = [];
+    if (!heirs.length) return { state, dm, events: [{ t: 'info', text: 'No living players to receive XP.' }] };
+    if (dm.pendingXp <= 0) return { state, dm, events: [{ t: 'info', text: 'No XP waiting.' }] };
+    const share = Math.floor(dm.pendingXp / heirs.length), spare = dm.pendingXp - share * heirs.length, got = new Map(heirs.map((c, i) => [c.id, share + (i === 0 ? spare : 0)]));
+    const combatants = state.combatants.map(c => { if (!got.has(c.id)) return c; const r = grantXp(c, got.get(c.id)); events.push({ t: 'xp', id: c.id, text: `${nm(c)} gains ${got.get(c.id)} XP`, }, ...r.events); return r.c; });
+    return { state: { ...state, combatants }, dm: { ...dm, pendingXp: 0 }, events };
+  }
+  function awardLoot(state, dm, index, toId) {
+    const item = dm.pendingLoot[index], i = state.combatants.findIndex(c => c.id === toId);
+    if (!item) throw new Error('No such loot'); if (i < 0) throw new Error('No such recipient');
+    const combatants = state.combatants.slice(); combatants[i] = { ...combatants[i], inventory: [...combatants[i].inventory, item] };
+    return { state: { ...state, combatants }, dm: { ...dm, pendingLoot: dm.pendingLoot.filter((_, k) => k !== index) }, events: [{ t: 'loot', id: toId, text: `${nm(combatants[i])} receives ${D.ITEMS[item].name}` }] };
+  }
+  function normalizeDm(raw) {
+    const d = emptyDm(); if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return d;
+    const n0 = v => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0), s = (v, m) => (typeof v === 'string' ? v.slice(0, m) : '');
+    d.pendingXp = n0(raw.pendingXp); d.gold = n0(raw.gold); d.session = s(raw.session, 20000); d.encNotes = s(raw.encNotes, 5000);
+    d.pendingLoot = (Array.isArray(raw.pendingLoot) ? raw.pendingLoot : []).filter(i => typeof i === 'string' && D.ITEMS[i]).slice(0, 200);
+    d.npcs = (Array.isArray(raw.npcs) ? raw.npcs : []).filter(x => x && typeof x === 'object').slice(0, 200).map((x, i) => ({ id: s(x.id, 20) || 'n' + i, name: s(x.name, 60) || 'Unnamed NPC', notes: s(x.notes, 3000) }));
+    d.quests = (Array.isArray(raw.quests) ? raw.quests : []).filter(x => x && typeof x === 'object').slice(0, 200).map((x, i) => ({ id: s(x.id, 20) || 'q' + i, title: s(x.title, 80) || 'Untitled quest', status: ['open', 'done', 'failed'].includes(x.status) ? x.status : 'open', notes: s(x.notes, 3000) }));
+    return d;
+  }
+
+  // ---------- Player view ----------
+  const visible = (c, dmView) => dmView || !c.hidden;
+
+  return { SLOTS, dist, gearView, gearBonus, recalc, setMax, equip, unequip, weaponRange, areaTiles, geomFor, planCast, placeSurface, triggerSurface,
+    xpFor, levelForXp, killXp, grantXp, spendPoint, rollLoot, emptyDm, collectRewards, distributeXp, awardLoot, normalizeDm, visible };
+});
+
+</script>
+<script>
+const E = DOS2, D = DOS2DATA, W = DOS2WORLD, $ = id => document.getElementById(id), SURF_KEYS = Object.keys(D.SURFACES);
+const SURF_ICON = { fire: '🔥', poison: '☠', water: '💧', oil: '◒', electric: 'ϟ', 'cursed-fire': '♜', blessed: '✦' };
+const KEY = 'dos2-battleboard-autosave-v2';
+let rows = 10, cols = 14, surfaces = {}, state = { round: 1, activeId: null, combatants: [] }, settings = { apPerTurn: 4, maxAP: 6, autoSurfaces: true }, logLines = [], dm = W.emptyDm(), dmView = true, tilePx = 48, aim = null, plan = null, lastPlanKey = '';
+const openSec = new Set(), LIB_KEY = 'dos2-battleboard-library-v1';
+let selectedId = null, selectedTile = null, tool = 'select', armedMoveId = null, dragId = null, selSkillId = null, targets = new Set(), rollLock = false, lastBreakdown = null;
+const history = E.createHistory(100);
+
+const h = (tag, props = {}, ...kids) => { const el = document.createElement(tag); for (const [k, v] of Object.entries(props)) { if (k === 'class') el.className = v; else if (k.startsWith('on')) el[k] = v; else if (v !== false && v != null) el.setAttribute(k, v === true ? '' : v); } for (const kid of kids.flat()) if (kid != null) el.append(kid); return el; };
+const say = s => { $('statusText').textContent = s; };
+const cfg = () => ({ apPerTurn: settings.apPerTurn, maxAP: settings.maxAP });
+const byId = id => state.combatants.find(c => c.id === id);
+const tileKey = (x, y) => `${x},${y}`;
+const occupant = (x, y) => state.combatants.find(c => c.x === x && c.y === y);
+function log(s) { logLines.unshift(`R${state.round} · ${s}`); if (logLines.length > 500) logLines.length = 500; }
+const logEvents = evs => evs.forEach(e => log(e.text));
+
+// ---- history / persistence ----
+const snap = () => JSON.parse(JSON.stringify({ rows, cols, surfaces, state, settings, log: logLines, dm }));
+function restore(s) { rows = s.rows; cols = s.cols; surfaces = s.surfaces; state = s.state; settings = s.settings; logLines = s.log; dm = s.dm || W.emptyDm(); aim = null; $('autoSurf').checked = settings.autoSurfaces !== false; $('rows').value = rows; $('cols').value = cols; $('setApTurn').value = settings.apPerTurn; $('setMaxAp').value = settings.maxAP; if (!byId(selectedId)) selectedId = null; targets = new Set([...targets].filter(byId)); armedMoveId = null; renderAll(); }
+function collect() { const r = W.collectRewards(state, dm, Math.random); if (r.events.length) { state = r.state; dm = r.dm; logEvents(r.events); } }
+function commit(fn) { history.push(snap()); fn(); collect(); renderAll(); }
+function surfaceTrigger(id, trig) { const r = W.triggerSurface(state, surfaces, id, trig); state = r.state; logEvents(r.events); }
+function persist() { try { localStorage.setItem(KEY, JSON.stringify(E.serializeSave(currentSave()))); } catch (e) { say('Autosave failed (browser storage full?). Use Export encounter to back up.'); } }
+const currentSave = () => ({ name: $('encName').value, cols, rows, surfaces, log: logLines.slice().reverse(), settings, state, dm });
+function applyLoaded(d) { rows = d.rows; cols = d.cols; surfaces = d.surfaces; state = d.state; settings = d.settings; logLines = d.log.slice().reverse(); dm = W.normalizeDm(d.dm); aim = null; $('autoSurf').checked = settings.autoSurfaces !== false; $('encName').value = d.name; $('rows').value = rows; $('cols').value = cols; $('setApTurn').value = settings.apPerTurn; $('setMaxAp').value = settings.maxAP; selectedId = state.combatants[0]?.id ?? null; targets = new Set(); armedMoveId = null; }
+
+// ---- helpers ----
+function resort() { state.combatants = E.sortInitiative(state.combatants); }
+function freeTile(pref) { const free = (x, y) => x >= 0 && y >= 0 && x < cols && y < rows && !occupant(x, y); if (pref && free(pref.x, pref.y)) return pref; for (let k = 0; k < cols * rows; k++) { const x = k % cols, y = Math.floor(k / cols); if (free(x, y)) return { x, y }; } return { x: 0, y: 0 }; }
+function shrink(file) { return new Promise(res => { const r = new FileReader(); r.onload = () => { const img = new Image(); img.onload = () => { const s = Math.min(img.width, img.height), c = document.createElement('canvas'); c.width = c.height = 96; c.getContext('2d').drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, 96, 96); res(c.toDataURL('image/jpeg', 0.8)); }; img.onerror = () => res(''); img.src = r.result; }; r.onerror = () => res(''); r.readAsDataURL(file); }); }
+function weaponFor(level) { const l = E.levelScaledDamage(level); return { min: Math.round(l * 0.9), max: Math.round(l * 1.1) }; }
+
+function addCombatant(portrait) {
+  const type = $('newType').value, level = Math.max(1, Math.min(21, Number($('newLevel').value) || 1));
+  const pos = freeTile(type === 'player' ? { x: 1, y: Math.floor(rows / 2) } : { x: cols - 2, y: Math.floor(rows / 2) });
+  const name = $('newName').value.trim() || `${type === 'player' ? 'Player' : 'Enemy'} ${state.combatants.length + 1}`;
+  const v = Math.max(1, Number($('newVit').value) || 100), pa = Math.max(0, Number($('newPA').value) || 0), ma = Math.max(0, Number($('newMA').value) || 0);
+  commit(() => {
+    const c = E.normalizeCombatant({ name, type, level, ...pos, maxVitality: v, maxPA: pa, maxMA: ma, ap: settings.apPerTurn, maxAP: settings.maxAP, apPerTurn: settings.apPerTurn, weapon: weaponFor(level), portrait: portrait || '', skills: D.SKILLS.map(s => s.id) }, cfg());
+    state.combatants.push(c); resort(); selectedId = c.id; log(`${name} added at (${c.x + 1}, ${c.y + 1}).`);
+  });
+  $('newName').value = ''; $('newPortrait').value = '';
+}
+function addTplUnit(tpl, level) {
+  const n = state.combatants.filter(c => c.name.startsWith(tpl.name)).length;
+  const c = E.buildEnemy({ ...tpl, apPerTurn: settings.apPerTurn }, level, E.uid()); c.name = n ? `${tpl.name} ${n + 1}` : tpl.name; c.maxAP = settings.maxAP; c.ap = Math.min(c.ap, c.maxAP); c.loot = tpl.loot || '';
+  Object.assign(c, freeTile({ x: cols - 2, y: Math.floor(rows / 2) })); state.combatants.push(W.recalc(c)); resort(); selectedId = c.id; log(`${c.name} (level ${level}) added at (${c.x + 1}, ${c.y + 1}).`);
+}
+function addTemplate(count = 1) {
+  const tpl = D.ENEMIES.find(t => t.id === $('tplSelect').value), level = Math.max(1, Math.min(21, Number($('tplLevel').value) || 1)); if (!tpl) return;
+  commit(() => { for (let k = 0; k < count; k++) addTplUnit(tpl, level); });
+}
+function moveCombatant(id, x, y) {
+  const c = byId(id); if (!c || x < 0 || y < 0 || x >= cols || y >= rows) return;
+  const o = occupant(x, y); if (o && o.id !== id) { say(`${o.name} occupies that tile.`); return; }
+  commit(() => { const old = `(${c.x + 1}, ${c.y + 1})`; c.x = x; c.y = y; selectedId = id; selectedTile = { x, y }; log(`${c.name} moved ${old} → (${x + 1}, ${y + 1}).`); if (settings.autoSurfaces) surfaceTrigger(id, 'enter'); });
+}
+function setC(id, fn) { const i = state.combatants.findIndex(c => c.id === id); if (i < 0) return; commit(() => { const c = JSON.parse(JSON.stringify(state.combatants[i])); fn(c); state.combatants[i] = W.recalc(E.normalizeCombatant(c, cfg())); resort(); }); }
+
+// ---- turn control ----
+function nextTurn() {
+  if (!state.combatants.length) return say('Add combatants first.');
+  commit(() => { const r = E.nextTurn(state, cfg()); state = r.state; logEvents(r.events); if (state.activeId) { selectedId = state.activeId; if (settings.autoSurfaces) surfaceTrigger(state.activeId, 'start'); } });
+}
+function resetEncounter() {
+  if (!confirm('Reset the encounter? Round, AP, resources, statuses and cooldowns are restored and enemies can pay out rewards again. Positions, surfaces and rewards already waiting stay.')) return;
+  commit(() => { state = { round: 1, activeId: null, combatants: state.combatants.map(c => ({ ...c, vitality: c.maxVitality, pa: c.maxPA, ma: c.maxMA, ap: 0, statuses: [], cooldowns: {}, defeated: false, skipNext: false, rewarded: false, surfStamp: '' })) }; log('Encounter reset.'); });
+}
+
+// ---- rendering ----
+function bar(cls, label, cur, max, hideNums) { const b = h('div', { class: 'bar ' + cls }); const i = h('i'); i.style.width = `${max > 0 ? Math.max(0, Math.min(100, cur / max * 100)) : 0}%`; b.append(i, h('span', {}, hideNums ? label : `${label} ${cur}/${max}`)); return b; }
+function portraitEl(c, cls) { if (c.portrait) { const im = h('img', { src: c.portrait, alt: c.name }); im.className = cls; return im; } return h('div', { class: cls }, c.name.split(/\s+/).map(a => a[0]).join('').slice(0, 2).toUpperCase()); }
+function renderBoard() {
+  const b = $('board'); b.innerHTML = ''; b.style.setProperty('--t', tilePx + 'px'); b.style.gridTemplateColumns = `repeat(${cols},${tilePx}px)`; b.style.gridTemplateRows = `repeat(${rows},${tilePx}px)`; const inArea = new Set((plan && plan.tiles ? plan.tiles : []).map(t => tileKey(t.x, t.y)));
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    const el = h('div', { class: 'tile' + (selectedTile && selectedTile.x === x && selectedTile.y === y ? ' sel' : '') + (inArea.has(tileKey(x, y)) ? ' area' : '') + (aim && aim.x === x && aim.y === y ? ' aim' : ''), title: `(${x + 1}, ${y + 1})${surfaces[tileKey(x, y)] ? ' · ' + D.SURFACES[surfaces[tileKey(x, y)]].label : ''}` });
+    const sf = surfaces[tileKey(x, y)];
+    if (sf) { el.append(h('div', { class: 'surface ' + sf }), h('span', { class: 'surface-icon' }, SURF_ICON[sf] || '')); }
+    const c0 = occupant(x, y), c = c0 && W.visible(c0, dmView) ? c0 : null;
+    if (c) {
+      const tok = h('div', { class: `token ${c.type}${c.id === selectedId ? ' selected' : ''}${c.id === state.activeId ? ' active' : ''}${c.defeated ? ' defeated' : ''}${c.hidden ? ' hiddenunit' : ''}`, draggable: tool === 'select' ? 'true' : null, title: dmView || c.type === 'player' ? `${c.name} · VIT ${c.vitality}/${c.maxVitality}${c.hidden ? ' · hidden from players' : ''}` : c.name });
+      if (c.portrait) tok.append(h('img', { src: c.portrait, alt: c.name })); else tok.append(h('span', {}, c.name.split(/\s+/).map(a => a[0]).join('').slice(0, 3).toUpperCase()));
+      const hp = h('div', { class: 'hpbar' }), fill = h('i'); fill.style.width = `${Math.max(0, Math.min(100, c.vitality / c.maxVitality * 100))}%`; hp.append(fill); tok.append(hp, h('div', { class: 'token-label' }, c.name));
+      tok.onclick = e => { e.stopPropagation(); if (tool === 'aim') { setAim(x, y); return; } if (tool !== 'select') return; selectedId = c.id; armedMoveId = c.id; renderAll(); say(`${c.name} selected. Click a tile to move it.`); };
+      tok.ondragstart = e => { dragId = c.id; e.dataTransfer.setData('text/plain', c.id); };
+      el.append(tok);
+    }
+    el.onclick = () => onTileClick(x, y);
+    el.ondragover = e => { if (dragId) { e.preventDefault(); el.classList.add('dragover'); } };
+    el.ondragleave = () => { el.classList.remove('dragover'); };
+    el.ondrop = e => { e.preventDefault(); const id = e.dataTransfer.getData('text/plain') || dragId; dragId = null; moveCombatant(id, x, y); };
+    b.append(el);
+  }
+}
+function onTileClick(x, y) {
+  const k = tileKey(x, y);
+  if (tool === 'surface') { commit(() => { const r = W.placeSurface(surfaces, x, y, $('surfaceType').value); surfaces = r.surfaces; log(`${D.SURFACES[$('surfaceType').value].label} painted at (${x + 1}, ${y + 1}).${r.note ? ' ' + r.note : ''}`); }); return; }
+  if (tool === 'aim') { setAim(x, y); return; }
+  if (tool === 'erase') { if (surfaces[k]) commit(() => { delete surfaces[k]; log(`Surface erased at (${x + 1}, ${y + 1}).`); }); return; }
+  if (armedMoveId) { const id = armedMoveId; armedMoveId = null; moveCombatant(id, x, y); return; }
+  selectedTile = { x, y }; say(`Tile (${x + 1}, ${y + 1}) selected${surfaces[k] ? ' · ' + D.SURFACES[surfaces[k]].label : ''}.`); renderBoard();
+}
+function renderList() {
+  const list = $('combatantList'); list.innerHTML = '';
+  if (!state.combatants.length) list.append(h('div', { class: 'notice' }, 'No combatants yet.'));
+  for (const c of state.combatants.filter(q => W.visible(q, dmView))) {
+    const hn = !dmView && c.type === 'enemy';
+    const info = h('div', { class: 'info' }, h('strong', {}, `${c.id === state.activeId ? '▶ ' : ''}${c.name}`), h('small', { class: 'muted' }, `${c.type} · Lv ${c.level} · Init ${c.initiative}${c.defeated ? ' · DEFEATED' : ''}${c.skipNext ? ' · skips next turn' : ''}${c.hidden ? ' · hidden' : ''}`),
+      h('div', { class: 'bars' }, bar('vit', 'VIT', c.vitality, c.maxVitality, hn), bar('pa', 'PA', c.pa, c.maxPA, hn), bar('ma', 'MA', c.ma, c.maxMA, hn), bar('ap', 'AP', c.ap, c.maxAP, hn)));
+    if (c.statuses.length) info.append(h('div', { class: 'chips' }, c.statuses.map(s => h('span', { class: 'chip' }, `${E.STATUS[s.id].name} ${s.turns}`))));
+    const d = h('div', { class: `listitem${c.id === selectedId ? ' selected' : ''}${c.id === state.activeId ? ' active' : ''}${c.defeated ? ' defeated' : ''}` }, portraitEl(c, 'mini'), info);
+    d.onclick = () => { selectedId = c.id; armedMoveId = null; renderAll(); };
+    list.append(d);
+  }
+}
+const nf = (label, val, min, onSet, max) => { const inp = h('input', { type: 'number', value: String(val), min: String(min) }); inp.onchange = () => { let v = Number(inp.value); if (!Number.isFinite(v)) v = val; v = Math.max(min, max != null ? Math.min(max, v) : v); onSet(v); }; return h('label', {}, label, inp); };
+function renderSelected() {
+  const p = $('selectedPanel'), c = byId(selectedId); p.innerHTML = '';
+  if (!c) { p.append(h('div', { class: 'notice' }, 'Select a token or a name in the turn order.')); return; }
+  const id = c.id, S = (key, fn) => v => setC(id, x => fn(x, v));
+  const name = h('input', { type: 'text', value: c.name }); name.onchange = () => setC(id, x => { x.name = name.value.trim() || x.name; });
+  p.append(h('label', {}, 'Name', name), h('div', { class: 'row' }, h('span', { class: 'pill' }, c.type.toUpperCase()), h('span', { class: 'pill' }, `Tile ${c.x + 1}, ${c.y + 1}`), c.defeated ? h('span', { class: 'pill warn' }, 'DEFEATED') : null));
+  p.append(h('div', { class: 'sidegrid' },
+    nf('Level', c.level, 1, S('level', (x, v) => { x.level = v; }), 21), nf('Initiative', c.initiative, -99, S('i', (x, v) => { x.initiative = v; })), h('label', {}, 'Random init', h('button', { onclick: () => setC(id, x => { x.initiative = 1 + Math.floor(Math.random() * 20); }) }, 'd20 (T)')),
+    nf('Vitality', c.vitality, 0, S('v', (x, v) => { x.vitality = Math.min(v, x.maxVitality); x.defeated = x.vitality <= 0; })), nf('Max Vit.', c.maxVitality, 1, S('mv', (x, v) => { Object.assign(x, W.setMax(x, 'maxVitality', v)); })), h('span'),
+    nf('Phys. Armour', c.pa, 0, S('pa', (x, v) => { x.pa = Math.min(v, x.maxPA); })), nf('Max PA', c.maxPA, 0, S('mpa', (x, v) => { Object.assign(x, W.setMax(x, 'maxPA', v)); })), h('span'),
+    nf('Magic Armour', c.ma, 0, S('ma', (x, v) => { x.ma = Math.min(v, x.maxMA); })), nf('Max MA', c.maxMA, 0, S('mma', (x, v) => { Object.assign(x, W.setMax(x, 'maxMA', v)); })), h('span'),
+    nf('AP', c.ap, 0, S('ap', (x, v) => { x.ap = Math.min(v, x.maxAP); })), nf('Max AP', c.maxAP, 0, S('map', (x, v) => { x.maxAP = v; })), nf('AP / turn', c.apPerTurn, 0, S('apt', (x, v) => { x.apPerTurn = v; }))));
+  p.append(progressBlock(c), gearBlock(c));
+  p.append(h('details', {}, h('summary', {}, 'Base attributes, abilities, weapon, resistances (gear adds on top)'), h('div', { class: 'stack details-content' },
+    h('div', { class: 'sidegrid' }, ...['STR', 'FIN', 'INT'].map(k => nf(k, c.stats[k], 0, S(k, (x, v) => { x.stats[k] = v; })))),
+    h('div', { class: 'sidegrid' }, ...['warfare', 'pyrokinetic', 'geomancer'].map(k => nf(k, c.abilities[k] || 0, 0, S(k, (x, v) => { x.abilities[k] = v; }), 10))),
+    h('div', { class: 'sidegrid' }, nf('Weapon min', c.weapon.min, 0, S('wmin', (x, v) => { x.weapon.min = v; })), nf('Weapon max', c.weapon.max, 0, S('wmax', (x, v) => { x.weapon.max = v; })), nf('Shield PA', c.shieldPA, 0, S('sh', (x, v) => { x.shieldPA = v; }))),
+    h('div', { class: 'notice' }, 'Resistance %: negative takes more damage, 100 is immune, above 100 heals.'),
+    h('div', { class: 'sidegrid' }, ...['Physical', 'Fire', 'Water', 'Air', 'Earth', 'Poison'].map(k => nf(k, c.resistances[k] || 0, -200, S(k, (x, v) => { x.resistances[k] = v; }), 200))))));
+  const known = h('div', { class: 'stack' }); D.SKILLS.forEach(s => { const cb = h('input', { type: 'checkbox', checked: c.skills.includes(s.id) }); cb.onchange = () => setC(id, x => { x.skills = cb.checked ? [...new Set([...x.skills, s.id])] : x.skills.filter(k => k !== s.id); }); known.append(h('label', { class: 'check' }, cb, `${s.name} (${s.school})`)); });
+  p.append(h('details', {}, h('summary', {}, `Known skills (${c.skills.length})`), h('div', { class: 'skill-list' }, known)));
+  const st = h('div', { class: 'stack' }), chips = h('div', { class: 'chips' });
+  c.statuses.forEach(s => chips.append(h('span', { class: 'chip' }, `${E.STATUS[s.id].name} · ${s.turns}t`, h('button', { title: 'Remove', onclick: () => setC(id, x => { x.statuses = x.statuses.filter(q => q.id !== s.id); }) }, '×'))));
+  const sel = h('select', {}, ...Object.entries(E.STATUS).map(([k, v]) => h('option', { value: k }, v.name)));
+  const apply = h('button', { onclick: () => { commit(() => { const r = E.applyStatus(byId(id), sel.value, { ignoreGate: true }); state.combatants = state.combatants.map(q => q.id === id ? r.target : q); log(`GM applied ${E.STATUS[sel.value].name} to ${c.name}.`); }); } }, 'Apply (GM)');
+  st.append(chips, h('div', { class: 'row' }, sel, apply)); p.append(h('div', {}, h('div', { class: 'muted tiny' }, 'Status effects'), st));
+  p.append(dmBlock(c));
+  p.append(h('div', { class: 'row' }, h('button', { onclick: () => commit(() => { const x = byId(id); x.vitality = Math.min(x.maxVitality, x.vitality + 20); x.defeated = x.vitality <= 0; log(`${x.name} healed 20 Vitality (GM).`); }) }, 'Heal +20'),
+    h('button', { class: 'danger', onclick: () => commit(() => { state.combatants = state.combatants.filter(q => q.id !== id); if (state.activeId === id) state.activeId = null; selectedId = null; targets.delete(id); log(`${c.name} removed.`); }) }, 'Remove')));
+}
+function skillBlock(actor) {
+  const sk = D.SKILLS.find(s => s.id === selSkillId); if (!sk) return null;
+  const reasons = []; if (state.activeId && state.activeId !== actor.id) reasons.push('not their turn'); if (actor.ap < sk.ap) reasons.push(`needs ${sk.ap} AP`); if ((actor.cooldowns[sk.id] || 0) > 0) reasons.push(`cooldown ${actor.cooldowns[sk.id]}`); if (actor.defeated) reasons.push('defeated');
+  return { sk, reasons };
+}
+function renderSkillPanel() {
+  const p = $('skillPanel'); p.innerHTML = ''; const a = byId(selectedId);
+  if (!a) { p.append(h('div', { class: 'notice' }, 'Select the acting combatant first.')); return; }
+  const mine = D.SKILLS.filter(s => a.skills.includes(s.id));
+  if (!mine.length) { p.append(h('div', { class: 'notice' }, `${a.name} knows no skills. Tick some under Known skills.`)); return; }
+  if (!mine.some(s => s.id === selSkillId)) selSkillId = mine[0].id;
+  const sel = h('select', {}); let g = null, og = null;
+  mine.forEach(s => { if (s.school !== g) { g = s.school; og = h('optgroup', { label: g }); sel.append(og); } const cd = a.cooldowns[s.id] || 0; og.append(h('option', { value: s.id, selected: s.id === selSkillId }, `${s.name} · ${s.ap} AP${cd ? ` · CD ${cd}` : ''}`)); });
+  sel.onchange = () => { selSkillId = sel.value; lastBreakdown = null; renderSkillPanel(); };
+  const { sk, reasons } = skillBlock(a);
+  p.append(h('label', {}, `${a.name}'s skill`, sel));
+  p.append(h('div', { class: 'notice' }, `${sk.school} · ${sk.ap} AP · cooldown ${sk.cooldown} · ${['utility', 'restore'].includes(sk.kind) ? 'no damage' : sk.kind === 'heal' ? 'healing' : sk.type + ' damage'}${sk.hits ? ` · ${sk.hits} hits` : ''}${sk.maxTargets ? ` · up to ${sk.maxTargets} targets` : ''}. ${sk.notes || ''} `, h('span', { class: 'pill' }, `numbers: ${sk.verified}`)));
+  if (reasons.length) p.append(h('div', { class: 'notice' }, h('span', { class: 'pill warn' }, 'Blocked: ' + reasons.join(', ') + ' (GM override can bypass)')));
+  p.append(planLine(sk));
+  const tl = h('div', { class: 'stack' }); state.combatants.filter(q => W.visible(q, dmView)).forEach(c => { const cb = h('input', { type: 'checkbox', checked: targets.has(c.id) }); cb.onchange = () => { cb.checked ? targets.add(c.id) : targets.delete(c.id); }; tl.append(h('label', { class: 'check' }, cb, `${c.name} (${c.type}${c.defeated ? ', defeated' : ''}) VIT ${c.vitality} PA ${c.pa} MA ${c.ma}`)); });
+  p.append(h('div', {}, h('div', { class: 'muted tiny' }, 'Targets'), h('div', { class: 'target-list' }, tl)));
+  p.append(h('div', { class: 'row' }, h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'modCrit' }), 'Critical hit'), h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'gmOverride' }), 'GM override')));
+  p.append(h('div', { class: 'sidegrid two' }, h('label', {}, 'High ground %', h('input', { type: 'number', id: 'modHG', value: '0' })), h('label', {}, 'Elemental gear %', h('input', { type: 'number', id: 'modGear', value: '0' })), h('label', {}, 'Weapon bonus %', h('input', { type: 'number', id: 'modWeapon', value: '0' })), h('label', {}, 'Misc %', h('input', { type: 'number', id: 'modMisc', value: '0' }))));
+  p.append(h('div', { class: 'row' }, h('button', { onclick: previewSkill }, 'Preview min / avg / max'), h('button', { class: 'primary', id: 'rollBtn', onclick: rollSkill }, 'Roll & apply')));
+  p.append(h('div', { id: 'breakdown', class: 'breakdown' }));
+  if (lastBreakdown) drawBreakdown(lastBreakdown);
+}
+const n0 = id => Number($(id)?.value) || 0;
+const modOpts = () => ({ crit: !!$('modCrit')?.checked, highGround: n0('modHG'), gear: n0('modGear'), weapon: n0('modWeapon'), misc: n0('modMisc') });
+function previewSkill() {
+  const a = byId(selectedId), sk = D.SKILLS.find(s => s.id === selSkillId), out = $('breakdown'); out.innerHTML = '';
+  if (sk.kind === 'utility' || sk.kind === 'restore') { out.append(h('div', { class: 'res' }, sk.kind === 'restore' ? `Restores ${sk.pct}% of max ${sk.pool === 'ma' ? 'Magic' : 'Physical'} Armour (amount is provisional).` : 'No damage. Applies: ' + (sk.statuses || []).map(s => E.STATUS[s.id].name).join(', '))); return; }
+  const ts = [...targets].map(byId).filter(Boolean); if (!ts.length) { say('Tick at least one target to preview resistances.'); ts.push({ name: '(no resistance)', resistances: {} }); }
+  ts.forEach(t => { try { const r = E.damageRange(sk, E.attackerOf(W.gearView(a)), { ...modOpts(), resist: E.totalResist(t, sk.type) }); out.append(h('div', { class: 'res' }, h('b', {}, t.name), `: min ${r.min} · avg ${r.avg} · max ${r.max}`)); } catch (e) { out.append(h('div', { class: 'res' }, 'Cannot calculate: ' + e.message)); } });
+}
+function drawBreakdown(b) {
+  const out = $('breakdown'); if (!out) return; out.innerHTML = '';
+  b.results.forEach(r => {
+    const box = h('div', { class: 'res' }, h('b', {}, r.name));
+    if (r.calc && r.calc.kind === 'damage') {
+      box.append(h('div', {}, `Base ${r.calc.base[0].toFixed(1)}–${r.calc.base[1].toFixed(1)} × ${r.calc.factors.map(f => `${f.name} ${f.value.toFixed(2)}`).join(' × ')} = ×${r.calc.multiplier.toFixed(3)}`));
+      box.append(h('div', {}, 'Hits: ' + r.calc.hits.map(x => `roll ${x.roll.toFixed(1)} → ${x.amount}${x.amount !== x.afterResist ? ` → ${x.afterResist} after resistance` : ''}`).join('; ')));
+      box.append(h('div', {}, `Total ${r.calc.total} ${r.calc.type}: armour absorbed ${r.absorbed}, Vitality lost ${r.vitality}${r.healed ? `, healed ${r.healed}` : ''}`));
+    } else if (r.calc) box.append(h('div', {}, `Healed ${r.healed}`));
+    if (r.restored) box.append(h('div', {}, `Armour restored ${r.restored}`));
+    r.statuses.forEach(s => box.append(h('div', {}, `${E.STATUS[s.id].name}: ${s.applied ? 'applied' : 'resisted (' + s.reason + ')'}`)));
+    out.append(box);
+  });
+}
+let lockTimer = null;
+function rollSkill() {
+  if (rollLock) return; const a = byId(selectedId), sk = D.SKILLS.find(s => s.id === selSkillId); if (!a || !sk) return;
+  const prob = castProblem(); if (prob && !$('gmOverride')?.checked) { say(prob + '. Tick GM override to cast anyway.'); return; }
+  const r = E.useSkill(state, a.id, sk, [...targets], { ...modOpts(), override: !!$('gmOverride')?.checked }, Math.random, cfg());
+  if (!r.ok) { say(r.reason + '.'); return; }
+  rollLock = true; clearTimeout(lockTimer); lockTimer = setTimeout(() => { rollLock = false; }, 600); // guards against double clicks
+  lastBreakdown = { results: r.results.map(x => ({ ...x, name: byId(x.targetId)?.name || '?' })) };
+  commit(() => { state = r.state; logEvents(r.events); });
+  say(`${sk.name} resolved.`);
+}
+// ---- targeting ----
+function setAim(x, y) { aim = { x, y }; selectedTile = { x, y }; renderAll(); }
+function updatePlan() {
+  const a = byId(selectedId); plan = null; if (!a) return;
+  const mine = D.SKILLS.filter(s => a.skills.includes(s.id)); if (!mine.length) return;
+  if (!mine.some(s => s.id === selSkillId)) selSkillId = mine[0].id;
+  const sk = D.SKILLS.find(s => s.id === selSkillId); plan = W.planCast(state, a.id, sk, aim, cols, rows);
+  const k = [a.id, sk.id, aim ? aim.x + ',' + aim.y : '', state.combatants.map(c => c.id + c.x + c.y + (c.defeated ? 1 : 0)).join()].join('|');
+  if (k !== lastPlanKey) { lastPlanKey = k; targets = new Set(plan.targetIds); }
+}
+function castProblem() {
+  if (!plan) return 'Select an actor who knows a skill';
+  if (!plan.ok) return plan.reason;
+  const okIds = new Set(plan.candidateIds), bad = [...targets].map(byId).filter(c => c && !okIds.has(c.id));
+  if (bad.length) return `${bad.map(c => c.name).join(', ')} outside the skill's area or range`;
+  if (!targets.size) return 'No targets selected';
+  return null;
+}
+function planLine(sk) {
+  const a = byId(selectedId), g = W.geomFor(sk, a);
+  const info = `${g.shape}${g.range ? ' · range ' + g.range : ''}${g.size ? ' · size ' + g.size : ''}${g.friendlyFire ? ' · hits allies too' : ''} (1 tile = 1 m; ${D.GEOM[sk.id]?.cited ? 'figures from the skill notes' : 'range and size provisional'})`;
+  return h('div', { class: 'notice' }, plan && plan.ok ? h('b', {}, `Aim OK: ${plan.targetIds.length} in the area. `) : h('span', { class: 'pill warn' }, '⚠ ' + (plan ? plan.reason : 'no plan')), ' ', info, ' ', h('button', { onclick: () => setTool('aim') }, 'Aim on board'));
+}
+// ---- progression, gear, DM blocks ----
+function det(title, key, ...kids) { const d = h('details', { class: 'dmd', open: openSec.has(key) }, h('summary', {}, title), h('div', { class: 'stack details-content' }, ...kids)); d.ontoggle = () => { d.open ? openSec.add(key) : openSec.delete(key); }; return d; }
+function tryThen(check, apply) { try { check(); } catch (e) { say(e.message + '.'); return; } commit(apply); }
+function replaceC(id, fn) { const i = state.combatants.findIndex(c => c.id === id); state.combatants[i] = fn(state.combatants[i]); }
+function progressBlock(c) {
+  const P = D.PROGRESSION, cur = Math.max(c.xp, W.xpFor(c.level)), base = W.xpFor(c.level), nextAt = c.level >= P.maxLevel ? null : W.xpFor(c.level + 1);
+  const bar = h('div', { class: 'xpbar' }, h('i')); bar.firstChild.style.width = (nextAt ? Math.min(100, Math.max(0, (cur - base) / (nextAt - base) * 100)) : 100) + '%';
+  const kids = [h('div', { class: 'muted tiny' }, `Level ${c.level} · XP ${cur}${nextAt ? ' / ' + nextAt : ' (max level)'}`), bar];
+  if (c.points.attr || c.points.combat) {
+    const row = h('div', { class: 'mini-row' }, h('span', { class: 'pill warn' }, `${c.points.attr} attribute · ${c.points.combat} combat points`));
+    if (c.points.attr) ['STR', 'FIN', 'INT'].forEach(k => row.append(h('button', { onclick: () => tryThen(() => W.spendPoint(c, 'attr', k), () => { replaceC(c.id, x => W.spendPoint(x, 'attr', k)); log(`${c.name} raises ${k}.`); }) }, `+${k}`)));
+    if (c.points.combat) ['warfare', 'pyrokinetic', 'geomancer'].forEach(k => row.append(h('button', { onclick: () => tryThen(() => W.spendPoint(c, 'combat', k), () => { replaceC(c.id, x => W.spendPoint(x, 'combat', k)); log(`${c.name} raises ${k}.`); }) }, `+${k}`)));
+    kids.push(row);
+  }
+  const amt = h('input', { type: 'number', min: '0', value: '0', class: 'reward-amount' });
+  kids.push(h('div', { class: 'mini-row' }, amt, h('button', { onclick: () => tryThen(() => W.grantXp(c, Number(amt.value)), () => { const r = W.grantXp(byId(c.id), Number(amt.value)); replaceC(c.id, () => r.c); log(`${c.name} gains ${Number(amt.value)} XP.`); logEvents(r.events); }) }, 'Give XP')));
+  kids.push(h('div', { class: 'notice' }, `Level-ups grant ${P.attrPointsPerLevel} attribute and ${P.combatPointsPerLevel} combat point(s) (provisional). Maximums grow with the level-scaling formulas; current values rise by the same amount.`));
+  return det('Level, XP & points', 'prog', ...kids);
+}
+function gearBlock(c) {
+  const v = W.gearView(c), kids = [h('div', { class: 'notice' }, `Effective: weapon ${v.weapon.min}–${v.weapon.max}${v.shieldPA ? ' · shield ' + v.shieldPA + ' PA' : ''} · STR ${v.stats.STR} FIN ${v.stats.FIN} INT ${v.stats.INT}. Gear scales with the wearer's level (adaptation).`)];
+  W.SLOTS.forEach(slot => {
+    const eq = c.equipment[slot], carried = c.inventory.filter(i => D.ITEMS[i]?.slot === slot);
+    const sel = h('select', {}, h('option', { value: '' }, carried.length ? 'Equip…' : '(none carried)'), ...carried.map(i => h('option', { value: i }, D.ITEMS[i].name)));
+    sel.onchange = () => { if (sel.value) tryThen(() => W.equip(c, sel.value), () => { replaceC(c.id, x => W.equip(x, sel.value)); log(`${c.name} equips ${D.ITEMS[sel.value].name}.`); }); };
+    kids.push(h('div', { class: 'mini-row' }, h('b', {}, slot), h('span', { class: 'item' }, eq ? D.ITEMS[eq].name : '—'), eq ? h('button', { onclick: () => commit(() => { replaceC(c.id, x => W.unequip(x, slot)); log(`${c.name} unequips ${D.ITEMS[eq].name}.`); }) }, 'Unequip') : null, sel));
+  });
+  const give = h('select', {}, ...Object.entries(D.ITEMS).map(([k, it]) => h('option', { value: k }, `${it.name} (${it.slot})`)));
+  kids.push(h('div', { class: 'mini-row' }, give, h('button', { onclick: () => commit(() => { replaceC(c.id, x => ({ ...x, inventory: [...x.inventory, give.value] })); log(`${c.name} is given ${D.ITEMS[give.value].name}.`); }) }, 'Give item'),
+    h('button', { onclick: () => commit(() => { replaceC(c.id, x => ['iron-sword', 'round-shield', 'leather-vest'].reduce((q, i) => W.equip({ ...q, inventory: [...q.inventory, i] }, i), x)); log(`${c.name} receives a starter kit.`); }) }, 'Starter kit')));
+  kids.push(h('div', { class: 'muted tiny' }, `Carried: ${c.inventory.map(i => D.ITEMS[i]?.name || i).join(', ') || 'nothing'}`));
+  return det('Equipment & inventory', 'gear', ...kids);
+}
+function dmBlock(c) {
+  if (!dmView) return h('span');
+  const hid = h('input', { type: 'checkbox', checked: c.hidden }); hid.onchange = () => setC(c.id, x => { x.hidden = hid.checked; });
+  const notes = h('textarea', {}, c.notes); notes.onchange = () => setC(c.id, x => { x.notes = notes.value; });
+  const kids = [h('label', { class: 'check' }, hid, 'Hidden from players (not drawn in Player view)'), h('label', {}, 'Private notes (DM only)', notes)];
+  if (c.type === 'enemy') {
+    const lt = h('select', {}, h('option', { value: '' }, '(no loot)'), ...Object.keys(D.LOOT).map(k => h('option', { value: k, selected: c.loot === k }, k))); lt.onchange = () => setC(c.id, x => { x.loot = lt.value; });
+    const xr = h('input', { type: 'number', min: '0', value: c.xpReward ?? '', placeholder: 'auto' }); xr.onchange = () => setC(c.id, x => { x.xpReward = xr.value === '' ? null : Math.max(0, Number(xr.value) || 0); });
+    kids.push(h('div', { class: 'sidegrid two' }, h('label', {}, 'Loot table', lt), h('label', {}, `XP reward (auto ${W.killXp(c.level)})`, xr)));
+  }
+  return det('DM: hidden, notes, rewards', 'dmblock', ...kids);
+}
+const readLib = () => { try { const l = JSON.parse(localStorage.getItem(LIB_KEY) || '[]'); return Array.isArray(l) ? l.filter(x => x && x.name && x.data) : []; } catch (e) { return []; } };
+const writeLib = l => { try { localStorage.setItem(LIB_KEY, JSON.stringify(l)); return true; } catch (e) { say('Library save failed (browser storage full?). Use Export encounter.'); return false; } };
+function renderDm() {
+  const p = $('dmPanel'); p.innerHTML = ''; if (!dmView) return;
+  p.append(h('h2', {}, 'DM tools')); const wrap = h('div', { class: 'section stack' }); p.append(wrap);
+  // preparation
+  const enc = h('textarea', { placeholder: 'Terrain, tactics, read-aloud text, secrets…' }, dm.encNotes); enc.onchange = () => commit(() => { dm.encNotes = enc.value; });
+  const gsel = h('select', {}, ...D.ENEMIES.map(t => h('option', { value: t.id }, t.name))), gcount = h('input', { type: 'number', min: '1', max: '12', value: '2', class: 'group-count' }), glevel = h('input', { type: 'number', min: '1', max: '21', value: $('tplLevel').value, class: 'group-level' });
+  const lib = readLib(), libList = h('div', { class: 'stack' });
+  lib.forEach((e, i) => libList.append(h('div', { class: 'mini-row' }, h('span', { class: 'item' }, `${e.name} · ${String(e.saved || '').slice(0, 10)}`),
+    h('button', { onclick: () => { try { const d = E.loadSave(e.data, SURF_KEYS); history.push(snap()); applyLoaded(d); log(`Loaded "${e.name}" from the library.`); renderAll(); } catch (err) { say('Could not load: ' + err.message); } } }, 'Load'),
+    h('button', { class: 'danger', onclick: () => { const l = readLib(); l.splice(i, 1); writeLib(l); renderAll(); } }, 'Delete'))));
+  wrap.append(det('Encounter preparation', 'prep', h('label', {}, 'Encounter notes (DM only)', enc),
+    h('div', { class: 'mini-row' }, gsel, h('label', {}, 'x', gcount), h('label', {}, 'Lv', glevel), h('button', { onclick: () => { const tpl = D.ENEMIES.find(t => t.id === gsel.value), n = Math.max(1, Math.min(12, Number(gcount.value) || 1)), lv = Math.max(1, Math.min(21, Number(glevel.value) || 1)); commit(() => { for (let k = 0; k < n; k++) addTplUnit(tpl, lv); }); } }, 'Add group')),
+    h('button', { onclick: () => commit(() => { state.combatants.forEach(c => { c.initiative = 1 + Math.floor(Math.random() * 20); }); resort(); log('Initiative rolled (d20) for everyone (adaptation).'); }) }, 'Roll initiative (d20) for all'),
+    h('button', { onclick: () => { const l = readLib().filter(x => x.name !== $('encName').value); l.push({ name: $('encName').value || 'Untitled', saved: new Date().toISOString(), data: E.serializeSave(currentSave()) }); if (writeLib(l)) { say('Saved to the library.'); renderAll(); } } }, 'Save this encounter to the library'),
+    h('div', { class: 'muted tiny' }, lib.length ? 'Library (this browser only; use Export for backups):' : 'Library is empty. Saved encounters live in this browser only.'), libList));
+  // rewards
+  const pxp = h('input', { type: 'number', min: '0', value: String(dm.pendingXp), class: 'pending-xp' }); pxp.onchange = () => commit(() => { dm.pendingXp = Math.max(0, Math.floor(Number(pxp.value) || 0)); });
+  const gold = h('input', { type: 'number', min: '0', value: String(dm.gold), class: 'party-gold' }); gold.onchange = () => commit(() => { dm.gold = Math.max(0, Math.floor(Number(gold.value) || 0)); });
+  const loot = h('div', { class: 'stack' });
+  dm.pendingLoot.forEach((id, i) => loot.append(h('div', { class: 'mini-row' }, h('span', { class: 'item' }, `${D.ITEMS[id].name} (${D.ITEMS[id].slot})`), h('button', { disabled: !byId(selectedId), onclick: () => tryThen(() => { if (!byId(selectedId)) throw new Error('Select a recipient first'); }, () => { const r = W.awardLoot(state, dm, i, selectedId); state = r.state; dm = r.dm; logEvents(r.events); }) }, 'Give to selected'))));
+  wrap.append(det('Rewards & loot', 'rewards', h('div', { class: 'notice' }, 'Defeated enemies add XP, gold and loot here once. Kill XP is 1/8 of the level-up cost (adaptation).'),
+    h('div', { class: 'mini-row' }, h('label', {}, 'Pending XP', pxp), h('label', {}, 'Party gold', gold)),
+    h('button', { class: 'primary', onclick: () => commit(() => { const r = W.distributeXp(state, dm); state = r.state; dm = r.dm; logEvents(r.events); }) }, 'Share XP between living players'),
+    dm.pendingLoot.length ? loot : h('div', { class: 'muted tiny' }, 'No loot waiting.')));
+  // NPCs and quests
+  const npcs = h('div', { class: 'stack' });
+  dm.npcs.forEach((n, i) => { const nn = h('input', { type: 'text', value: n.name }), nt = h('textarea', {}, n.notes); nn.onchange = () => commit(() => { dm.npcs[i].name = nn.value || 'Unnamed NPC'; }); nt.onchange = () => commit(() => { dm.npcs[i].notes = nt.value; });
+    npcs.append(h('div', { class: 'item stack' }, nn, nt, h('button', { class: 'danger', onclick: () => commit(() => { dm.npcs.splice(i, 1); }) }, 'Delete'))); });
+  wrap.append(det('NPC notes', 'npcs', npcs, h('button', { onclick: () => commit(() => { dm.npcs.push({ id: E.uid(), name: 'New NPC', notes: '' }); openSec.add('npcs'); }) }, 'Add NPC')));
+  const quests = h('div', { class: 'stack' });
+  dm.quests.forEach((q, i) => { const qt = h('input', { type: 'text', value: q.title }), qs = h('select', {}, ...['open', 'done', 'failed'].map(k => h('option', { value: k, selected: q.status === k }, k))), qn = h('textarea', {}, q.notes);
+    qt.onchange = () => commit(() => { dm.quests[i].title = qt.value || 'Untitled quest'; }); qs.onchange = () => commit(() => { dm.quests[i].status = qs.value; }); qn.onchange = () => commit(() => { dm.quests[i].notes = qn.value; });
+    quests.append(h('div', { class: 'item stack' }, qt, h('div', { class: 'mini-row' }, qs, h('button', { class: 'danger', onclick: () => commit(() => { dm.quests.splice(i, 1); }) }, 'Delete')), qn)); });
+  wrap.append(det('Quest log', 'quests', quests, h('button', { onclick: () => commit(() => { dm.quests.push({ id: E.uid(), title: 'New quest', status: 'open', notes: '' }); openSec.add('quests'); }) }, 'Add quest')));
+  const ses = h('textarea', { placeholder: 'Session notes, recap, hooks…', class: 'session-notes' }, dm.session); ses.onchange = () => commit(() => { dm.session = ses.value; });
+  wrap.append(det('Session notes', 'session', ses));
+}
+function renderAll() {
+  updatePlan(); renderBoard(); renderList(); renderSelected(); renderSkillPanel(); renderDm();
+  const act = byId(state.activeId); $('turnLabel').textContent = `Round ${state.round} · ${act ? (W.visible(act, dmView) ? act.name : 'An unseen enemy') : 'No active turn'}`;
+  $('combatLog').innerHTML = ''; if (dmView) logLines.slice(0, 200).forEach(l => $('combatLog').append(h('div', {}, l))); else $('combatLog').append(h('div', {}, 'The log is hidden in Player view.'));
+  $('undoBtn').disabled = history.size() === 0; persist();
+}
+
+// ---- wiring ----
+$('surfaceType').append(...SURF_KEYS.map(k => h('option', { value: k }, D.SURFACES[k].label)));
+$('legend').append(...SURF_KEYS.map(k => { const i = h('i'); i.append(h('div', { class: 'surface surface-swatch ' + k })); return h('span', { class: 'sw' }, i, `${SURF_ICON[k]} ${D.SURFACES[k].label}`); }));
+$('tplSelect').append(...D.ENEMIES.map(t => h('option', { value: t.id }, t.name)));
+$('addCombatant').onclick = async () => { const f = $('newPortrait').files[0]; addCombatant(f ? await shrink(f) : ''); };
+
+$('nextTurn').onclick = nextTurn; $('resetEnc').onclick = resetEncounter;
+$('undoBtn').onclick = () => { const s = history.undo(); if (!s) return say('Nothing to undo.'); restore(s); say('Undone.'); };
+const setTool = t => { tool = t; armedMoveId = null; for (const [k, id] of [['select', 'toolSelect'], ['aim', 'toolAim'], ['surface', 'toolSurface'], ['erase', 'toolErase']]) $(id).classList.toggle('active', t === k); say(t === 'select' ? 'Select / move mode.' : t === 'aim' ? 'Aim mode: click a tile (or token) to aim the chosen skill. The highlighted tiles are the area.' : t === 'surface' ? `Paint mode: ${D.SURFACES[$('surfaceType').value].label}.` : 'Erase mode.'); renderAll(); };
+$('toolSelect').onclick = () => setTool('select'); $('toolAim').onclick = () => setTool('aim'); $('toolSurface').onclick = () => setTool('surface'); $('toolErase').onclick = () => setTool('erase');
+$('surfaceType').onchange = () => { if (tool === 'surface') setTool('surface'); };
+$('clearSurfaces').onclick = () => { if (Object.keys(surfaces).length) commit(() => { surfaces = {}; log('All surfaces cleared.'); }); };
+$('resize').onclick = () => {
+  const nc = Math.max(6, Math.min(30, Number($('cols').value) || 14)), nr = Math.max(6, Math.min(24, Number($('rows').value) || 10));
+  commit(() => { cols = nc; rows = nr; surfaces = Object.fromEntries(Object.entries(surfaces).filter(([k]) => { const [x, y] = k.split(',').map(Number); return x < cols && y < rows; }));
+    const placed = []; state.combatants.forEach(c => { let x = Math.min(cols - 1, c.x), y = Math.min(rows - 1, c.y); if (placed.some(p => p.x === x && p.y === y)) { for (let k = 0; k < cols * rows; k++) { const tx = k % cols, ty = Math.floor(k / cols); if (!placed.some(p => p.x === tx && p.y === ty)) { x = tx; y = ty; break; } } } c.x = x; c.y = y; placed.push({ x, y }); });
+    $('cols').value = cols; $('rows').value = rows; log(`Grid resized to ${cols} × ${rows}.`); });
+};
+$('setApTurn').onchange = () => { settings.apPerTurn = Math.max(0, Number($('setApTurn').value) || 0); persist(); };
+$('setMaxAp').onchange = () => { settings.maxAP = Math.max(0, Number($('setMaxAp').value) || 0); persist(); };
+$('applyAp').onclick = () => commit(() => { state.combatants = state.combatants.map(c => ({ ...c, apPerTurn: settings.apPerTurn, maxAP: settings.maxAP, ap: Math.min(c.ap, settings.maxAP) })); log(`AP settings applied to all: +${settings.apPerTurn} per turn, max ${settings.maxAP}.`); });
+const sel = () => byId(selectedId);
+$('apMinus').onclick = () => { const c = sel(); if (c) setC(c.id, x => { x.ap = Math.max(0, x.ap - 1); }); else say('Select a combatant first.'); };
+$('apPlus').onclick = () => { const c = sel(); if (c) setC(c.id, x => { x.ap = Math.min(x.maxAP, x.ap + 1); }); else say('Select a combatant first.'); };
+$('apFull').onclick = () => { const c = sel(); if (c) setC(c.id, x => { x.ap = x.maxAP; }); else say('Select a combatant first.'); };
+$('skipBtn').onclick = () => { const c = sel(); if (!c) return say('Select a combatant first.'); commit(() => { const x = byId(c.id); x.skipNext = !x.skipNext; log(`${x.name} ${x.skipNext ? 'will skip' : 'will no longer skip'} their next turn.`); }); };
+$('defeatBtn').onclick = () => { const c = sel(); if (!c) return say('Select a combatant first.'); commit(() => { const x = byId(c.id); x.defeated = !x.defeated; if (!x.defeated && x.vitality <= 0) x.vitality = 1; log(`${x.name} ${x.defeated ? 'marked defeated' : 'revived'} (GM).`); }); };
+$('surfaceTick').onclick = () => {
+  if (!selectedTile) return say('Select a tile first.'); const k = tileKey(selectedTile.x, selectedTile.y), sf = surfaces[k], c = occupant(selectedTile.x, selectedTile.y);
+  if (!sf) return say('Selected tile has no surface.'); if (!c) return say('No combatant on the selected tile.');
+  commit(() => { const r = E.resolveSurface(c, sf, D.SURFACES); state.combatants = state.combatants.map(q => q.id === c.id ? r.target : q); logEvents(r.events); });
+};
+$('clearBoard').onclick = () => { if (confirm('Remove all combatants and surfaces? You can still Undo.')) commit(() => { state = { round: 1, activeId: null, combatants: [] }; surfaces = {}; selectedId = null; targets = new Set(); log('Board cleared.'); }); };
+$('clearLog').onclick = () => commit(() => { logLines = []; });
+$('saveBtn').onclick = () => { const blob = new Blob([JSON.stringify(E.serializeSave(currentSave()), null, 1)], { type: 'application/json' }), url = URL.createObjectURL(blob), a = h('a', { href: url, download: ($('encName').value || 'encounter').replace(/[^\w-]+/g, '_') + '.json' }); a.click(); URL.revokeObjectURL(url); say('Encounter exported.'); };
+$('loadBtn').onclick = () => $('loadFile').click();
+$('loadFile').onchange = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { try { const d = E.loadSave(JSON.parse(r.result), SURF_KEYS); history.push(snap()); applyLoaded(d); if (d.warnings.length) { alert('Imported with fixes:\n' + d.warnings.join('\n')); } log('Encounter imported.'); renderAll(); } catch (err) { alert('Could not import encounter: ' + err.message); } }; r.readAsText(f); e.target.value = ''; };
+
+$('playerView').onchange = () => { dmView = !$('playerView').checked; renderAll(); say(dmView ? 'DM view.' : 'Player view: hidden units, enemy numbers, notes and the log are not shown.'); };
+$('autoSurf').onchange = () => { settings.autoSurfaces = $('autoSurf').checked; persist(); };
+$('zoomIn').onclick = () => { tilePx = Math.min(72, tilePx + 6); renderBoard(); };
+$('zoomOut').onclick = () => { tilePx = Math.max(28, tilePx - 6); renderBoard(); };
+$('addTemplate').onclick = () => addTemplate(1);
+try { const raw = localStorage.getItem(KEY); if (raw) { applyLoaded(E.loadSave(JSON.parse(raw), SURF_KEYS)); say('Restored your last session (autosave).'); } } catch (e) { /* ignore corrupt autosave */ }
+renderAll();
+</script>
+</body>
+</html>

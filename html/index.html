@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ember & Aether — DOS2 Tabletop</title>
+<link rel="stylesheet" href="../css/styles.css">
+</head>
+<body>
+<header>
+  <div><h1>✦ EMBER &amp; AETHER</h1><small>DOS2-INSPIRED TABLETOP · CAMPAIGN WORKSPACE</small></div>
+  <div class="row header-actions"><label class="check"><input type="checkbox" id="playerView"> Player view</label><button id="undoBtn">↶ Undo</button><button id="saveBtn">Export encounter</button><button id="loadBtn">Import encounter</button><input id="loadFile" type="file" accept=".json,application/json" hidden></div>
+</header>
+<nav class="main-nav" aria-label="Main navigation">
+  <a href="index.html" aria-current="page">⚔ Battleboard</a><a href="party.html">♙ Party &amp; Spells</a><a href="quest-log.html">✧ Quest Log</a><a href="notes.html">▤ Notes &amp; NPCs</a>
+</nav>
+<div class="app">
+<aside class="panel left">
+<details class="panel-group" open><summary>Encounter setup</summary>
+<div class="section stack">
+<label>Name<input id="encName" type="text" value="Untitled encounter"></label>
+<div class="row"><label>Columns<input id="cols" type="number" min="6" max="30" value="14"></label><label>Rows<input id="rows" type="number" min="6" max="24" value="10"></label><button id="resize">Resize</button></div>
+<div class="row"><label>AP / turn (new)<input id="setApTurn" type="number" min="0" value="4"></label><label>Max AP (new)<input id="setMaxAp" type="number" min="0" value="6"></label></div>
+<button id="applyAp" class="wide">Apply AP settings to all combatants</button>
+<label class="check"><input type="checkbox" id="autoSurf" checked> Surfaces trigger automatically (entering a tile, start of turn)</label>
+<div class="row"><button id="toolSelect" class="active">Select / move</button><button id="toolAim">Aim skill</button><button id="toolSurface">Paint</button><button id="toolErase">Erase</button></div>
+<label>Surface brush<select id="surfaceType"></select></label>
+<button id="clearSurfaces" class="wide">Clear all surfaces</button>
+<div class="legend" id="legend"></div>
+</div>
+</details>
+<details class="panel-group" open><summary>Add combatant</summary>
+<div class="section stack">
+<div class="row"><label>Name<input id="newName" type="text" placeholder="e.g. Red Prince" class="inline-name"></label><label>Type<select id="newType"><option value="player">Player</option><option value="enemy">Enemy</option></select></label></div>
+<div class="row"><label>Level<input id="newLevel" type="number" min="1" max="21" value="1"></label><label>Vitality<input id="newVit" type="number" min="1" value="100"></label></div>
+<div class="row"><label>Phys. Armour<input id="newPA" type="number" min="0" value="50"></label><label>Magic Armour<input id="newMA" type="number" min="0" value="50"></label></div>
+<label>Portrait (optional, shrunk to 96px)<input id="newPortrait" type="file" accept="image/*"></label>
+<button class="primary wide" id="addCombatant">Add to board</button>
+<div class="row"><label>Enemy template<select id="tplSelect"></select></label><label>Level<input id="tplLevel" type="number" min="1" max="21" value="5"></label></div>
+<button class="wide" id="addTemplate">Add enemy from template</button>
+<div class="notice">Template stats use the level-scaling formulas from Formulas.md. Armour scaling is partly provisional.</div>
+</div>
+</details>
+<details class="panel-group" open><summary>Turn order</summary><div class="section"><div id="combatantList" class="list"></div></div></details>
+<div id="dmPanel"></div>
+</aside>
+<main class="center">
+<div class="toolbar">
+<button id="nextTurn" class="primary">Next turn →</button><span id="turnLabel" class="pill">Round 1 · No active turn</span><button id="zoomOut" title="Zoom out">−</button><button id="zoomIn" title="Zoom in">+</button><span class="spacer"></span><button id="resetEnc">Reset encounter</button><button id="clearBoard" class="danger">Clear board</button>
+</div>
+<div class="boardwrap"><div id="board" aria-label="Battle grid"></div></div>
+<div class="toolbar"><span class="muted">Selected:</span><button id="apMinus">−1 AP</button><button id="apPlus">+1 AP</button><button id="apFull">Restore AP</button><button id="skipBtn">Skip next turn</button><button id="defeatBtn">Mark defeated</button><button id="surfaceTick">Resolve tile surface</button><span class="spacer"></span><span id="statusText" class="muted tiny">Add a combatant to begin.</span></div>
+</main>
+<aside class="panel right">
+<h2>Selected combatant</h2>
+<div class="section stack" id="selectedPanel"><div class="notice">Select a token or a name in the turn order.</div></div>
+<h2>Use skill</h2>
+<div class="section stack" id="skillPanel"></div>
+<details class="panel-group"><summary>Combat log</summary><div class="section"><div class="log" id="combatLog"></div><div class="row log-actions"><button id="clearLog">Clear log</button></div><p class="notice">The log is saved with the encounter export.</p></div></details>
+</aside>
+</div>
+<script src="../js/engine.js"></script>
+<script src="../js/data.js"></script>
+<script src="../js/world.js"></script>
+<script src="../js/app.js"></script>
+</body>
+</html>
